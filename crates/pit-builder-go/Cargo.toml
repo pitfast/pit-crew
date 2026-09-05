@@ -1,0 +1,15 @@
+[package]
+name = "pit-builder-go"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PitFast Go to WASI Component builder"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+pit-artifact = { path = "../pit-artifact" }
+pit-builder-core = { path = "../pit-builder-core" }
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true

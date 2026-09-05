@@ -1,0 +1,2 @@
+worlds = ["componentize-go:example/wasip2-example"]
+wit_paths = ["wit"]

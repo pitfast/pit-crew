@@ -1,0 +1,7 @@
+[project]
+name = "cpp-http"
+
+[build]
+language = "cpp"
+abi = "wasi-preview2"
+world = "wasi:http/proxy"

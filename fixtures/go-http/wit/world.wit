@@ -1,0 +1,5 @@
+package componentize-go:example;
+
+world wasip2-example {
+  include wasi:http/proxy@0.2.0;
+}

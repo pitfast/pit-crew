@@ -1,0 +1,7 @@
+[project]
+name = "typescript-http"
+
+[build]
+language = "typescript"
+abi = "wasi-preview2"
+world = "wasi:http/proxy"

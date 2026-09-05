@@ -1,0 +1,7 @@
+[project]
+name = "c-http"
+
+[build]
+language = "c"
+abi = "wasi-preview2"
+world = "wasi:http/proxy"

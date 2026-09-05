@@ -1,0 +1,7 @@
+[project]
+name = "python-http"
+
+[build]
+language = "python"
+abi = "wasi-preview2"
+world = "wasi:http/proxy"

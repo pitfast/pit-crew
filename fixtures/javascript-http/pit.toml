@@ -1,0 +1,7 @@
+[project]
+name = "javascript-http"
+
+[build]
+language = "javascript"
+abi = "wasi-preview2"
+world = "wasi:http/proxy"

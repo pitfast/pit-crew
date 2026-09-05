@@ -1,6 +1,12 @@
 [workspace]
 members = [
     "crates/pit-artifact",
+    "crates/pit-builder-core",
+    "crates/pit-builder-go",
+    "crates/pit-builder-native",
+    "crates/pit-builder-js",
+    "crates/pit-builder-python",
+    "crates/pit-builder-experimental",
     "crates/pit-crew",
     "crates/pit-builder-rust",
 ]

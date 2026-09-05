@@ -283,6 +283,10 @@ pub struct BuildSpec {
     pub target: String,
     pub profile: BuildProfile,
     pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -583,6 +587,8 @@ mod tests {
                 target: "wasm32-wasip1".into(),
                 profile: BuildProfile::Release,
                 fingerprint: "b".repeat(64),
+                toolchain: None,
+                toolchain_version: None,
             },
             runtime: RuntimeSpec {
                 abi: RuntimeAbi::wasi_preview1(),

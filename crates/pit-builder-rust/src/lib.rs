@@ -9,7 +9,9 @@ use pit_artifact::{
     ArtifactFormat, ArtifactManifest, ArtifactSpec, BuildProfile, BuildSpec, Capability,
     ComponentWorld, Entrypoint, RuntimeAbi, RuntimeSpec, SCHEMA_VERSION,
 };
-use pit_crew::{BuildArtifact, BuildRequest, BuilderAdapter};
+use pit_builder_core::{
+    BuildOutput, BuildRequest, Detection, Language, LanguageBuilder, ToolchainInfo,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
@@ -44,6 +46,32 @@ impl RustBuilder {
             && String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .any(|line| line.trim() == target))
+    }
+
+    async fn command_version(command: &str, args: &[&str]) -> Result<String> {
+        let output = Command::new(command)
+            .args(args)
+            .output()
+            .await
+            .with_context(|| format!("failed to run {command}; install the Rust toolchain"))?;
+        if !output.status.success() {
+            bail!(
+                "{command} version probe failed: {}",
+                compiler_output(&output.stdout, &output.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    async fn toolchain(&self, request: &BuildRequest) -> Result<ToolchainInfo> {
+        let version = Self::command_version("rustc", &["--version"]).await?;
+        Ok(ToolchainInfo {
+            name: "rustc".into(),
+            version: version.clone(),
+            compiler: Some(version),
+            componentizer: None,
+            target: request.abi.target().unwrap_or_default().into(),
+        })
     }
 
     async fn metadata(project_dir: &Path) -> Result<CargoMetadata> {
@@ -172,13 +200,28 @@ impl RustBuilder {
 }
 
 #[async_trait]
-impl BuilderAdapter for RustBuilder {
-    fn language(&self) -> &str {
-        "rust"
+impl LanguageBuilder for RustBuilder {
+    fn language(&self) -> Language {
+        Language::Rust
     }
 
-    fn detect(&self, project_dir: &Path) -> bool {
-        project_dir.join("Cargo.toml").is_file()
+    fn detect(&self, project_dir: &Path) -> Detection {
+        if project_dir.join("Cargo.toml").is_file() {
+            Detection::Yes
+        } else {
+            Detection::No
+        }
+    }
+
+    async fn probe_toolchain(&self) -> Result<ToolchainInfo> {
+        let version = Self::command_version("rustc", &["--version"]).await?;
+        Ok(ToolchainInfo {
+            name: "rustc".into(),
+            version: version.clone(),
+            compiler: Some(version),
+            componentizer: None,
+            target: "wasm32-wasip2".into(),
+        })
     }
 
     async fn fingerprint(&self, request: &BuildRequest) -> Result<String> {
@@ -188,13 +231,15 @@ impl BuilderAdapter for RustBuilder {
         let target = request.abi.target().ok_or_else(|| {
             anyhow::anyhow!("unsupported Rust WASI ABI '{}'", request.abi.as_str())
         })?;
+        let toolchain = self.toolchain(request).await?;
         for value in [
             BUILDER_CONTRACT,
-            self.language(),
+            self.language().as_str(),
             target,
             request.abi.as_str(),
             request.profile.as_str(),
             name.as_str(),
+            toolchain.version.as_str(),
         ] {
             hasher.update(value.as_bytes());
             hasher.update([0]);
@@ -212,9 +257,10 @@ impl BuilderAdapter for RustBuilder {
         Ok(format!("{:x}", hasher.finalize()))
     }
 
-    async fn build(&self, request: &BuildRequest, fingerprint: &str) -> Result<BuildArtifact> {
+    async fn build(&self, request: &BuildRequest, fingerprint: &str) -> Result<BuildOutput> {
         let metadata = Self::metadata(&request.project_dir).await?;
         let name = Self::select_binary(&metadata, request.bin.as_deref())?;
+        let toolchain = self.toolchain(request).await?;
         let cargo_artifact = self.build_project(request, &name).await?;
         let pit_dir = request.project_dir.join(".pit");
         let staging_dir = pit_dir.join("tmp");
@@ -238,10 +284,12 @@ impl BuilderAdapter for RustBuilder {
                 size_bytes: bytes.len() as u64,
             },
             build: BuildSpec {
-                language: self.language().to_owned(),
+                language: self.language().to_string(),
                 target: request.abi.target().unwrap_or_default().to_owned(),
                 profile: request.profile,
                 fingerprint: fingerprint.to_owned(),
+                toolchain: Some("rustc".into()),
+                toolchain_version: Some(toolchain.version.clone()),
             },
             runtime: runtime_spec(&request.abi, effective_world(request)),
             execution: request.execution_defaults.clone(),
@@ -251,9 +299,10 @@ impl BuilderAdapter for RustBuilder {
         tokio::fs::rename(&staging_path, &artifact_path)
             .await
             .with_context(|| format!("failed to promote {}", artifact_path.display()))?;
-        Ok(BuildArtifact {
+        Ok(BuildOutput {
             manifest,
             artifact_path,
+            toolchain,
         })
     }
 }
@@ -364,14 +413,18 @@ pub async fn fingerprint_project(request: &BuildRequest) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{RustBuilder, fingerprint_project, validate_wasm};
-    use pit_crew::{BuildRequest, BuilderAdapter};
+    use pit_builder_core::{Detection, LanguageBuilder};
+    use pit_crew::BuildRequest;
     use std::path::Path;
 
     #[test]
     fn detects_only_cargo_projects() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/rust-hello");
-        assert!(RustBuilder::new().detect(&fixture));
-        assert!(!RustBuilder::new().detect(Path::new("/definitely/not/a/project")));
+        assert_eq!(RustBuilder::new().detect(&fixture), Detection::Yes);
+        assert_eq!(
+            RustBuilder::new().detect(Path::new("/definitely/not/a/project")),
+            Detection::No
+        );
         assert!(pit_artifact::RuntimeAbi::wasi_preview1().target().is_some());
     }
 

@@ -1,11 +1,10 @@
 //! Public, CLI-independent build orchestration for PitFast.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
-use async_trait::async_trait;
-use pit_artifact::{ArtifactManifest, ExecutionDefaults};
+use anyhow::{Context, Result, bail};
+use pit_artifact::ArtifactManifest;
+use pit_builder_core::{BuildOutput, Detection};
 
 pub use pit_artifact::{
     ArtifactFormat, ArtifactSpec, BuildProfile, BuildSpec, Capability, ComponentWorld, Entrypoint,
@@ -13,54 +12,13 @@ pub use pit_artifact::{
     manifest_path, sha256_file,
 };
 
-#[derive(Debug, Clone)]
-pub struct BuildRequest {
-    pub project_dir: PathBuf,
-    pub bin: Option<String>,
-    pub profile: BuildProfile,
-    pub abi: RuntimeAbi,
-    pub world: Option<ComponentWorld>,
-    pub execution_defaults: ExecutionDefaults,
-    pub force: bool,
-}
+pub use pit_builder_core::{BuildRequest, Language, LanguageBuilder, ToolchainInfo};
+pub type BuildArtifact = BuildOutput;
 
-impl BuildRequest {
-    pub fn new(project_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            project_dir: project_dir.into(),
-            bin: None,
-            profile: BuildProfile::Release,
-            abi: RuntimeAbi::wasi_preview2(),
-            world: None,
-            execution_defaults: ExecutionDefaults::default(),
-            force: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuildArtifact {
-    pub manifest: ArtifactManifest,
-    pub artifact_path: PathBuf,
-}
-
-impl BuildArtifact {
-    pub fn from_manifest(project_dir: &Path, manifest: ArtifactManifest) -> Result<Self> {
-        let artifact_path = manifest.resolve_artifact_path(project_dir)?;
-        Ok(Self {
-            manifest,
-            artifact_path,
-        })
-    }
-}
-
-#[async_trait]
-pub trait BuilderAdapter: Send + Sync {
-    fn language(&self) -> &str;
-    fn detect(&self, project_dir: &Path) -> bool;
-    async fn fingerprint(&self, request: &BuildRequest) -> Result<String>;
-    async fn build(&self, request: &BuildRequest, fingerprint: &str) -> Result<BuildArtifact>;
-}
+/// Compatibility name retained for existing integrations. New builders should
+/// implement [`LanguageBuilder`] directly.
+pub trait BuilderAdapter: LanguageBuilder {}
+impl<T: LanguageBuilder + ?Sized> BuilderAdapter for T {}
 
 pub struct BuildOutcome {
     pub artifact: BuildArtifact,
@@ -68,15 +26,15 @@ pub struct BuildOutcome {
 }
 
 pub struct PitCrew {
-    adapters: Vec<Arc<dyn BuilderAdapter>>,
+    adapters: Vec<Arc<dyn LanguageBuilder>>,
 }
 
 impl PitCrew {
-    pub fn new(adapters: Vec<Arc<dyn BuilderAdapter>>) -> Self {
+    pub fn new(adapters: Vec<Arc<dyn LanguageBuilder>>) -> Self {
         Self { adapters }
     }
 
-    pub fn with_adapter(adapter: impl BuilderAdapter + 'static) -> Self {
+    pub fn with_adapter(adapter: impl LanguageBuilder + 'static) -> Self {
         Self::new(vec![Arc::new(adapter)])
     }
 
@@ -101,16 +59,27 @@ impl PitCrew {
             project_dir,
             ..request
         };
-        let adapter = self
+        let matches = self
             .adapters
             .iter()
-            .find(|adapter| adapter.detect(&request.project_dir))
-            .ok_or_else(|| {
-                anyhow!(
-                    "no PitCrew builder detected for {}",
-                    request.project_dir.display()
-                )
-            })?;
+            .filter(|adapter| {
+                request
+                    .language
+                    .is_none_or(|language| adapter.language() == language)
+                    && adapter.detect(&request.project_dir) == Detection::Yes
+            })
+            .collect::<Vec<_>>();
+        let adapter = match matches.as_slice() {
+            [adapter] => *adapter,
+            [] => bail!(
+                "no PitCrew builder detected for {}",
+                request.project_dir.display()
+            ),
+            _ => bail!(
+                "multiple PitCrew languages detected for {}; select --language",
+                request.project_dir.display()
+            ),
+        };
         let fingerprint = adapter
             .fingerprint(&request)
             .await
@@ -157,8 +126,8 @@ fn load_valid_cached_manifest(
         || manifest.build.target != request.abi.target().unwrap_or_default()
         || manifest.runtime.abi != request.abi
         || (request.abi.as_str() == "wasi-preview2"
-            && manifest.runtime.world
-                != Some(request.world.unwrap_or(ComponentWorld::WasiCliCommand)))
+            && request.world.is_some()
+            && manifest.runtime.world != request.world)
     {
         return None;
     }
@@ -170,12 +139,13 @@ fn load_valid_cached_manifest(
 
 #[cfg(test)]
 mod tests {
-    use super::{BuildArtifact, BuildProfile, BuildRequest, PitCrew};
+    use super::{BuildArtifact, BuildProfile, BuildRequest, Language, LanguageBuilder, PitCrew};
     use async_trait::async_trait;
     use pit_artifact::{
         ArtifactFormat, ArtifactManifest, ArtifactSpec, BuildSpec, Capability, Entrypoint,
         ExecutionDefaults, RuntimeAbi, RuntimeSpec,
     };
+    use pit_builder_core::{Detection, ToolchainInfo};
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -184,13 +154,57 @@ mod tests {
         builds: Arc<AtomicUsize>,
     }
 
+    struct DetectOnlyBuilder {
+        language: Language,
+    }
+
     #[async_trait]
-    impl super::BuilderAdapter for FakeBuilder {
-        fn language(&self) -> &str {
-            "test"
+    impl LanguageBuilder for DetectOnlyBuilder {
+        fn language(&self) -> Language {
+            self.language
         }
-        fn detect(&self, project_dir: &Path) -> bool {
-            project_dir.is_dir()
+
+        fn detect(&self, _project_dir: &Path) -> Detection {
+            Detection::Yes
+        }
+
+        async fn probe_toolchain(&self) -> anyhow::Result<ToolchainInfo> {
+            anyhow::bail!("probe not needed for detection test")
+        }
+
+        async fn fingerprint(&self, _request: &BuildRequest) -> anyhow::Result<String> {
+            anyhow::bail!("fingerprint not needed for detection test")
+        }
+
+        async fn build(
+            &self,
+            _request: &BuildRequest,
+            _fingerprint: &str,
+        ) -> anyhow::Result<BuildArtifact> {
+            anyhow::bail!("build not needed for detection test")
+        }
+    }
+
+    #[async_trait]
+    impl LanguageBuilder for FakeBuilder {
+        fn language(&self) -> Language {
+            Language::Rust
+        }
+        fn detect(&self, project_dir: &Path) -> Detection {
+            if project_dir.is_dir() {
+                Detection::Yes
+            } else {
+                Detection::No
+            }
+        }
+        async fn probe_toolchain(&self) -> anyhow::Result<ToolchainInfo> {
+            Ok(ToolchainInfo {
+                name: "test".into(),
+                version: "1".into(),
+                compiler: None,
+                componentizer: None,
+                target: "wasm32-wasip1".into(),
+            })
         }
         async fn fingerprint(&self, _request: &BuildRequest) -> anyhow::Result<String> {
             Ok("a".repeat(64))
@@ -219,6 +233,8 @@ mod tests {
                     target: "wasm32-wasip1".into(),
                     profile: BuildProfile::Release,
                     fingerprint: fingerprint.into(),
+                    toolchain: None,
+                    toolchain_version: None,
                 },
                 runtime: RuntimeSpec {
                     abi: RuntimeAbi::wasi_preview1(),
@@ -232,6 +248,13 @@ mod tests {
             Ok(BuildArtifact {
                 manifest,
                 artifact_path: path,
+                toolchain: ToolchainInfo {
+                    name: "test".into(),
+                    version: "1".into(),
+                    compiler: None,
+                    componentizer: None,
+                    target: "wasm32-wasip1".into(),
+                },
             })
         }
     }
@@ -264,6 +287,34 @@ mod tests {
                 .reused
         );
         assert_eq!(builds.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_detection_requires_explicit_language() {
+        let root = std::env::temp_dir().join(format!("pit-crew-detect-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let crew = PitCrew::new(vec![
+            Arc::new(DetectOnlyBuilder {
+                language: Language::Rust,
+            }),
+            Arc::new(DetectOnlyBuilder {
+                language: Language::Go,
+            }),
+        ]);
+        let error = match crew.build_with_status(BuildRequest::new(&root)).await {
+            Ok(_) => panic!("ambiguous detection unexpectedly built"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("multiple PitCrew languages detected"));
+
+        let mut request = BuildRequest::new(&root);
+        request.language = Some(Language::Go);
+        let error = match crew.build_with_status(request).await {
+            Ok(_) => panic!("detection test unexpectedly built"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("build fingerprint failed"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

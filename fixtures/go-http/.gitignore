@@ -1,0 +1,4 @@
+wit_exports.go
+wasi_*/
+go.sum
+.pit/

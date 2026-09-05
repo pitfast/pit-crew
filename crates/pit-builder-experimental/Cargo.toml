@@ -1,0 +1,13 @@
+[package]
+name = "pit-builder-experimental"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+pit-artifact = { path = "../pit-artifact" }
+pit-builder-core = { path = "../pit-builder-core" }
+sha2.workspace = true
+
