@@ -1,0 +1,3 @@
+.pit/
+target/
+Cargo.lock

@@ -178,6 +178,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "wasmparser",
 ]
 
 [[package]]

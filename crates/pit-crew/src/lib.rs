@@ -8,8 +8,9 @@ use async_trait::async_trait;
 use pit_artifact::{ArtifactManifest, ExecutionDefaults};
 
 pub use pit_artifact::{
-    ArtifactSpec, BuildProfile, BuildSpec, Capability, RuntimeAbi, RuntimeSpec, SCHEMA_VERSION,
-    WASI_PREVIEW1_ENTRYPOINT, manifest_path, sha256_file,
+    ArtifactFormat, ArtifactSpec, BuildProfile, BuildSpec, Capability, Entrypoint, RuntimeAbi,
+    RuntimeSpec, SCHEMA_VERSION, WASI_PREVIEW1_ENTRYPOINT, WASI_PREVIEW2_ENTRYPOINT, manifest_path,
+    sha256_file,
 };
 
 #[derive(Debug, Clone)]
@@ -17,6 +18,7 @@ pub struct BuildRequest {
     pub project_dir: PathBuf,
     pub bin: Option<String>,
     pub profile: BuildProfile,
+    pub abi: RuntimeAbi,
     pub execution_defaults: ExecutionDefaults,
     pub force: bool,
 }
@@ -27,6 +29,7 @@ impl BuildRequest {
             project_dir: project_dir.into(),
             bin: None,
             profile: BuildProfile::Release,
+            abi: RuntimeAbi::wasi_preview2(),
             execution_defaults: ExecutionDefaults::default(),
             force: false,
         }
@@ -147,7 +150,11 @@ fn load_valid_cached_manifest(
     fingerprint: &str,
 ) -> Option<ArtifactManifest> {
     let manifest = ArtifactManifest::load(manifest_path(&request.project_dir)).ok()?;
-    if manifest.build.fingerprint != fingerprint || manifest.build.profile != request.profile {
+    if manifest.build.fingerprint != fingerprint
+        || manifest.build.profile != request.profile
+        || manifest.build.target != request.abi.target().unwrap_or_default()
+        || manifest.runtime.abi != request.abi
+    {
         return None;
     }
     if manifest.verify_artifact(&request.project_dir).is_err() {
@@ -161,8 +168,8 @@ mod tests {
     use super::{BuildArtifact, BuildProfile, BuildRequest, PitCrew};
     use async_trait::async_trait;
     use pit_artifact::{
-        ArtifactManifest, ArtifactSpec, BuildSpec, Capability, ExecutionDefaults, RuntimeAbi,
-        RuntimeSpec,
+        ArtifactFormat, ArtifactManifest, ArtifactSpec, BuildSpec, Capability, Entrypoint,
+        ExecutionDefaults, RuntimeAbi, RuntimeSpec,
     };
     use std::path::Path;
     use std::sync::Arc;
@@ -193,24 +200,25 @@ mod tests {
             let dir = project.join(".pit/build");
             std::fs::create_dir_all(&dir)?;
             let path = dir.join("test.wasm");
-            std::fs::write(&path, b"wasm")?;
+            std::fs::write(&path, [0, 97, 115, 109, 1, 0, 0, 0])?;
             let manifest = ArtifactManifest {
                 schema_version: 1,
                 artifact: ArtifactSpec {
                     name: "test".into(),
                     path: "build/test.wasm".into(),
                     sha256: super::sha256_file(&path)?,
-                    size_bytes: 4,
+                    size_bytes: 8,
                 },
                 build: BuildSpec {
                     language: "test".into(),
-                    target: "test".into(),
+                    target: "wasm32-wasip1".into(),
                     profile: BuildProfile::Release,
                     fingerprint: fingerprint.into(),
                 },
                 runtime: RuntimeSpec {
                     abi: RuntimeAbi::wasi_preview1(),
-                    entrypoint: "_start".into(),
+                    entrypoint: Entrypoint::wasi_preview1(),
+                    format: ArtifactFormat::CoreModule,
                 },
                 execution: ExecutionDefaults::default(),
                 capabilities: vec![Capability::stdio()],
@@ -230,7 +238,8 @@ mod tests {
         let crew = PitCrew::with_adapter(FakeBuilder {
             builds: Arc::clone(&builds),
         });
-        let request = BuildRequest::new(&root);
+        let mut request = BuildRequest::new(&root);
+        request.abi = RuntimeAbi::wasi_preview1();
         assert!(
             !crew
                 .build_with_status(request.clone())

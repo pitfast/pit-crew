@@ -7,7 +7,8 @@ not a compiler:
 source project → builder adapter → WASM → .pit artifact
 ~~~
 
-Version 0.1 supports Rust projects with a wasm32-wasip1 binary target. It uses
+Version 0.4 supports Rust projects with wasm32-wasip2 by default, with
+wasm32-wasip1 as an explicit compatibility target. It uses
 cargo metadata for project and binary detection, invokes the installed Cargo
 toolchain, validates the resulting WebAssembly, and writes a SHA-256 identified
 artifact plus .pit/artifact.json.
@@ -15,7 +16,7 @@ artifact plus .pit/artifact.json.
 PitCrew never installs toolchains automatically. If the target is missing:
 
 ~~~bash
-rustup target add wasm32-wasip1
+rustup target add wasm32-wasip2
 ~~~
 
 ## Artifact contract
@@ -33,13 +34,14 @@ The shared pit-artifact crate owns the versioned .pit/artifact.json contract:
   },
   "build": {
     "language": "rust",
-    "target": "wasm32-wasip1",
+    "target": "wasm32-wasip2",
     "profile": "release",
     "fingerprint": "..."
   },
   "runtime": {
-    "abi": "wasi-preview1",
-    "entrypoint": "_start"
+    "abi": "wasi-preview2",
+    "entrypoint": "wasi:cli/command",
+    "format": "component"
   },
   "execution": {
     "timeout_ms": null,

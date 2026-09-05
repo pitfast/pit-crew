@@ -1,0 +1,2 @@
+[build]
+abi = "wasi-preview2"

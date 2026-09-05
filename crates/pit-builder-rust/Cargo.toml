@@ -3,7 +3,7 @@ name = "pit-builder-rust"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "PitFast Rust to WASI Preview 1 builder adapter"
+description = "PitFast Rust to WASI Preview 1 or Preview 2 builder adapter"
 
 [dependencies]
 anyhow.workspace = true

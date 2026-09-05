@@ -2,6 +2,7 @@
 name = "rust-hello"
 
 [build]
+abi = "wasi-preview2"
 # bin = "binary-name"
 
 [execution]

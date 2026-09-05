@@ -6,15 +6,14 @@ use std::process::Stdio;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use pit_artifact::{
-    ArtifactManifest, ArtifactSpec, BuildProfile, BuildSpec, Capability, RuntimeAbi, RuntimeSpec,
-    SCHEMA_VERSION, WASI_PREVIEW1_ENTRYPOINT,
+    ArtifactFormat, ArtifactManifest, ArtifactSpec, BuildProfile, BuildSpec, Capability,
+    Entrypoint, RuntimeAbi, RuntimeSpec, SCHEMA_VERSION,
 };
 use pit_crew::{BuildArtifact, BuildRequest, BuilderAdapter};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
-const TARGET: &str = "wasm32-wasip1";
 const BUILDER_CONTRACT: &str = "pit-builder-rust-v1";
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -25,7 +24,10 @@ impl RustBuilder {
         Self
     }
 
-    pub async fn target_available() -> Result<bool> {
+    pub async fn target_available_for(abi: &RuntimeAbi) -> Result<bool> {
+        let target = abi
+            .target()
+            .ok_or_else(|| anyhow::anyhow!("unsupported Rust WASI ABI '{}'", abi.as_str()))?;
         let output = Command::new("rustup")
             .args(["target", "list", "--installed"])
             .output()
@@ -34,7 +36,7 @@ impl RustBuilder {
         Ok(output.status.success()
             && String::from_utf8_lossy(&output.stdout)
                 .lines()
-                .any(|line| line.trim() == TARGET))
+                .any(|line| line.trim() == target))
     }
 
     async fn metadata(project_dir: &Path) -> Result<CargoMetadata> {
@@ -98,16 +100,19 @@ impl RustBuilder {
     }
 
     async fn build_project(&self, request: &BuildRequest, name: &str) -> Result<PathBuf> {
-        if !Self::target_available().await? {
+        let target = request.abi.target().ok_or_else(|| {
+            anyhow::anyhow!("unsupported Rust WASI ABI '{}'", request.abi.as_str())
+        })?;
+        if !Self::target_available_for(&request.abi).await? {
             bail!(
-                "Rust WASI target wasm32-wasip1 is not installed.\n\nInstall it with:\n\nrustup target add wasm32-wasip1"
+                "Rust WASI target {target} is not installed.\n\nInstall it with:\n\nrustup target add {target}"
             );
         }
         let mut command = Command::new("cargo");
         command
             .arg("build")
             .arg("--target")
-            .arg(TARGET)
+            .arg(target)
             .current_dir(&request.project_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -132,7 +137,7 @@ impl RustBuilder {
         let metadata = Self::metadata(&request.project_dir).await?;
         let path = metadata
             .target_directory
-            .join(TARGET)
+            .join(target)
             .join(request.profile.cargo_directory())
             .join(format!("{name}.wasm"));
         if !path.is_file() {
@@ -159,10 +164,14 @@ impl BuilderAdapter for RustBuilder {
         let metadata = Self::metadata(&request.project_dir).await?;
         let name = Self::select_binary(&metadata, request.bin.as_deref())?;
         let mut hasher = Sha256::new();
+        let target = request.abi.target().ok_or_else(|| {
+            anyhow::anyhow!("unsupported Rust WASI ABI '{}'", request.abi.as_str())
+        })?;
         for value in [
             BUILDER_CONTRACT,
             self.language(),
-            TARGET,
+            target,
+            request.abi.as_str(),
             request.profile.as_str(),
             name.as_str(),
         ] {
@@ -193,7 +202,7 @@ impl BuilderAdapter for RustBuilder {
         tokio::fs::copy(&cargo_artifact, &staging_path)
             .await
             .with_context(|| format!("failed to stage {}", cargo_artifact.display()))?;
-        validate_wasm(&staging_path).await?;
+        validate_wasm(&staging_path, &request.abi).await?;
         let bytes = tokio::fs::read(&staging_path).await?;
         let manifest = ArtifactManifest {
             schema_version: SCHEMA_VERSION,
@@ -205,14 +214,11 @@ impl BuilderAdapter for RustBuilder {
             },
             build: BuildSpec {
                 language: self.language().to_owned(),
-                target: TARGET.to_owned(),
+                target: request.abi.target().unwrap_or_default().to_owned(),
                 profile: request.profile,
                 fingerprint: fingerprint.to_owned(),
             },
-            runtime: RuntimeSpec {
-                abi: RuntimeAbi::wasi_preview1(),
-                entrypoint: WASI_PREVIEW1_ENTRYPOINT.to_owned(),
-            },
+            runtime: runtime_spec(&request.abi),
             execution: request.execution_defaults.clone(),
             capabilities: vec![Capability::stdio(), Capability::args(), Capability::env()],
         };
@@ -280,7 +286,7 @@ fn compiler_output(stdout: &[u8], stderr: &[u8]) -> String {
     }
 }
 
-pub async fn validate_wasm(path: impl AsRef<Path>) -> Result<()> {
+pub async fn validate_wasm(path: impl AsRef<Path>, abi: &RuntimeAbi) -> Result<()> {
     let path = path.as_ref();
     let bytes = tokio::fs::read(path)
         .await
@@ -288,10 +294,36 @@ pub async fn validate_wasm(path: impl AsRef<Path>) -> Result<()> {
     if bytes.is_empty() {
         bail!("WASM artifact is empty: {}", path.display());
     }
-    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
-        payload.with_context(|| format!("invalid WebAssembly artifact {}", path.display()))?;
+    let actual = pit_artifact::detect_artifact_format(path)?;
+    let expected = match abi.as_str() {
+        "wasi-preview1" => ArtifactFormat::CoreModule,
+        "wasi-preview2" => ArtifactFormat::Component,
+        _ => bail!("unsupported Rust WASI ABI '{}'", abi.as_str()),
+    };
+    if actual != expected {
+        bail!("WASM format mismatch: expected {expected:?}, found {actual:?}");
     }
     Ok(())
+}
+
+fn runtime_spec(abi: &RuntimeAbi) -> RuntimeSpec {
+    match abi.as_str() {
+        "wasi-preview1" => RuntimeSpec {
+            abi: abi.clone(),
+            entrypoint: Entrypoint::wasi_preview1(),
+            format: ArtifactFormat::CoreModule,
+        },
+        "wasi-preview2" => RuntimeSpec {
+            abi: abi.clone(),
+            entrypoint: Entrypoint::wasi_preview2(),
+            format: ArtifactFormat::Component,
+        },
+        _ => RuntimeSpec {
+            abi: abi.clone(),
+            entrypoint: Entrypoint::Custom(String::new()),
+            format: ArtifactFormat::CoreModule,
+        },
+    }
 }
 
 pub async fn fingerprint_project(request: &BuildRequest) -> Result<String> {
@@ -300,7 +332,7 @@ pub async fn fingerprint_project(request: &BuildRequest) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RustBuilder, TARGET, fingerprint_project, validate_wasm};
+    use super::{RustBuilder, fingerprint_project, validate_wasm};
     use pit_crew::{BuildRequest, BuilderAdapter};
     use std::path::Path;
 
@@ -309,14 +341,18 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/rust-hello");
         assert!(RustBuilder::new().detect(&fixture));
         assert!(!RustBuilder::new().detect(Path::new("/definitely/not/a/project")));
-        assert_eq!(TARGET, "wasm32-wasip1");
+        assert!(pit_artifact::RuntimeAbi::wasi_preview1().target().is_some());
     }
 
     #[tokio::test]
     async fn rejects_invalid_wasm() {
         let path = std::env::temp_dir().join(format!("pit-invalid-{}.wasm", std::process::id()));
         tokio::fs::write(&path, b"not wasm").await.unwrap();
-        assert!(validate_wasm(&path).await.is_err());
+        assert!(
+            validate_wasm(&path, &pit_artifact::RuntimeAbi::wasi_preview1())
+                .await
+                .is_err()
+        );
         let _ = tokio::fs::remove_file(path).await;
     }
 
@@ -342,8 +378,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fingerprint_separates_preview1_and_preview2() {
+        let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/rust-hello");
+        let p2 = BuildRequest::new(&project);
+        let mut p1 = p2.clone();
+        p1.abi = pit_artifact::RuntimeAbi::wasi_preview1();
+        assert_ne!(
+            fingerprint_project(&p1).await.unwrap(),
+            fingerprint_project(&p2).await.unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn builds_fixture_when_target_is_installed() {
-        if !RustBuilder::target_available().await.unwrap_or(false) {
+        if !RustBuilder::target_available_for(&pit_artifact::RuntimeAbi::wasi_preview1())
+            .await
+            .unwrap_or(false)
+        {
             return;
         }
         let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/rust-hello");

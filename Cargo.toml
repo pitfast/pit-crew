@@ -4,7 +4,7 @@ members = [
     "crates/pit-crew",
     "crates/pit-builder-rust",
 ]
-exclude = ["fixtures/rust-hello"]
+exclude = ["fixtures/rust-hello", "fixtures/rust-infinite", "fixtures/rust-memory", "fixtures/rust-cpu"]
 resolver = "2"
 
 [workspace.package]

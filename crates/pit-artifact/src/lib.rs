@@ -3,15 +3,18 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
+use wasmparser::{Encoding, Parser, Payload};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const WASI_PREVIEW1_ENTRYPOINT: &str = "_start";
+pub const WASI_PREVIEW2_ENTRYPOINT: &str = "wasi:cli/command";
 
 pub fn manifest_path(project_dir: &Path) -> PathBuf {
     project_dir.join(".pit/artifact.json")
@@ -25,12 +28,42 @@ impl RuntimeAbi {
         Self("wasi-preview1".to_owned())
     }
 
+    pub fn wasi_preview2() -> Self {
+        Self("wasi-preview2".to_owned())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
+    pub fn target(&self) -> Option<&'static str> {
+        match self.0.as_str() {
+            "wasi-preview1" => Some("wasm32-wasip1"),
+            "wasi-preview2" => Some("wasm32-wasip2"),
+            _ => None,
+        }
+    }
+
     pub fn is_supported(&self) -> bool {
-        self.0 == "wasi-preview1"
+        matches!(self.0.as_str(), "wasi-preview1" | "wasi-preview2")
+    }
+}
+
+impl FromStr for RuntimeAbi {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if matches!(value, "wasi-preview1" | "wasi-preview2") {
+            Ok(Self(value.to_owned()))
+        } else {
+            bail!("unsupported runtime ABI '{value}'; expected wasi-preview1 or wasi-preview2")
+        }
+    }
+}
+
+impl std::fmt::Display for RuntimeAbi {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -108,6 +141,79 @@ impl<'de> Deserialize<'de> for Capability {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArtifactFormat {
+    CoreModule,
+    Component,
+}
+
+impl std::fmt::Display for ArtifactFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::CoreModule => "core-module",
+            Self::Component => "component",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Entrypoint {
+    WasiPreview1Start,
+    WasiPreview2Command,
+    Custom(String),
+}
+
+impl Entrypoint {
+    pub fn wasi_preview1() -> Self {
+        Self::WasiPreview1Start
+    }
+
+    pub fn wasi_preview2() -> Self {
+        Self::WasiPreview2Command
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::WasiPreview1Start => WASI_PREVIEW1_ENTRYPOINT,
+            Self::WasiPreview2Command => WASI_PREVIEW2_ENTRYPOINT,
+            Self::Custom(value) => value,
+        }
+    }
+
+    fn from_string(value: String) -> Self {
+        match value.as_str() {
+            WASI_PREVIEW1_ENTRYPOINT => Self::wasi_preview1(),
+            WASI_PREVIEW2_ENTRYPOINT => Self::wasi_preview2(),
+            _ => Self::Custom(value),
+        }
+    }
+}
+
+impl Serialize for Entrypoint {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Entrypoint {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Self::from_string(String::deserialize(deserializer)?))
+    }
+}
+
+impl std::fmt::Display for Entrypoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BuildProfile {
     Debug,
@@ -149,7 +255,13 @@ pub struct BuildSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeSpec {
     pub abi: RuntimeAbi,
-    pub entrypoint: String,
+    pub entrypoint: Entrypoint,
+    #[serde(default = "default_artifact_format")]
+    pub format: ArtifactFormat,
+}
+
+fn default_artifact_format() -> ArtifactFormat {
+    ArtifactFormat::CoreModule
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,8 +316,20 @@ impl ArtifactManifest {
         {
             bail!("build metadata is incomplete or has an invalid fingerprint");
         }
-        if self.runtime.entrypoint.trim().is_empty() {
+        if self.runtime.entrypoint.as_str().trim().is_empty() {
             bail!("runtime entrypoint must not be empty");
+        }
+        let expected_format = match self.runtime.abi.as_str() {
+            "wasi-preview1" => ArtifactFormat::CoreModule,
+            "wasi-preview2" => ArtifactFormat::Component,
+            _ => self.runtime.format,
+        };
+        if self.runtime.format != expected_format {
+            bail!(
+                "runtime ABI '{}' requires {} format",
+                self.runtime.abi.as_str(),
+                expected_format
+            );
         }
         if self
             .capabilities
@@ -220,15 +344,19 @@ impl ArtifactManifest {
     pub fn validate_runtime_compatibility(&self) -> Result<()> {
         if !self.runtime.abi.is_supported() {
             bail!(
-                "unsupported runtime ABI '{}'; PitBox currently supports wasi-preview1",
+                "unsupported runtime ABI '{}'; PitBox currently supports wasi-preview1 and wasi-preview2",
                 self.runtime.abi.as_str()
             );
         }
-        if self.runtime.entrypoint != WASI_PREVIEW1_ENTRYPOINT {
+        let expected = match self.runtime.abi.as_str() {
+            "wasi-preview1" => WASI_PREVIEW1_ENTRYPOINT,
+            "wasi-preview2" => WASI_PREVIEW2_ENTRYPOINT,
+            _ => unreachable!(),
+        };
+        if self.runtime.entrypoint.as_str() != expected {
             bail!(
-                "unsupported WASI Preview 1 entrypoint '{}'; expected {}",
-                self.runtime.entrypoint,
-                WASI_PREVIEW1_ENTRYPOINT
+                "unsupported entrypoint '{}'; expected {expected}",
+                self.runtime.entrypoint.as_str()
             );
         }
         Ok(())
@@ -266,6 +394,14 @@ impl ArtifactManifest {
                 "artifact SHA-256 mismatch: manifest {}, actual {}",
                 self.artifact.sha256,
                 digest
+            );
+        }
+        let actual_format = detect_artifact_format(&path)?;
+        if actual_format != self.runtime.format {
+            bail!(
+                "artifact format mismatch: manifest {}, actual {}",
+                format_name(self.runtime.format),
+                format_name(actual_format)
             );
         }
         Ok(path)
@@ -316,6 +452,34 @@ impl ArtifactManifest {
     }
 }
 
+pub fn detect_artifact_format(path: &Path) -> Result<ArtifactFormat> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if bytes.is_empty() {
+        bail!("WASM artifact is empty: {}", path.display());
+    }
+    for payload in Parser::new(0).parse_all(&bytes) {
+        if let Payload::Version { encoding, .. } =
+            payload.with_context(|| format!("invalid WebAssembly artifact {}", path.display()))?
+        {
+            return Ok(match encoding {
+                Encoding::Module => ArtifactFormat::CoreModule,
+                Encoding::Component => ArtifactFormat::Component,
+            });
+        }
+    }
+    bail!(
+        "WASM artifact has no WebAssembly version header: {}",
+        path.display()
+    )
+}
+
+fn format_name(format: ArtifactFormat) -> &'static str {
+    match format {
+        ArtifactFormat::CoreModule => "core-module",
+        ArtifactFormat::Component => "component",
+    }
+}
+
 pub fn validate_relative_path(path: &Path) -> Result<()> {
     if path.is_absolute()
         || path.components().any(|component| {
@@ -357,7 +521,8 @@ mod tests {
             },
             runtime: RuntimeSpec {
                 abi: RuntimeAbi::wasi_preview1(),
-                entrypoint: WASI_PREVIEW1_ENTRYPOINT.into(),
+                entrypoint: Entrypoint::wasi_preview1(),
+                format: ArtifactFormat::CoreModule,
             },
             execution: ExecutionDefaults::default(),
             capabilities: vec![Capability::stdio(), Capability::args(), Capability::env()],
@@ -396,9 +561,44 @@ mod tests {
     #[test]
     fn unknown_abi_is_readable_but_not_compatible() {
         let mut value = manifest();
-        value.runtime.abi = RuntimeAbi("wasi-preview2".into());
+        value.runtime.abi = RuntimeAbi("wasi-future".into());
         assert!(value.validate().is_ok());
         assert!(value.validate_runtime_compatibility().is_err());
+    }
+
+    #[test]
+    fn preview2_manifest_roundtrips_with_component_contract() {
+        let mut value = manifest();
+        value.runtime = RuntimeSpec {
+            abi: RuntimeAbi::wasi_preview2(),
+            entrypoint: Entrypoint::wasi_preview2(),
+            format: ArtifactFormat::Component,
+        };
+        let decoded: ArtifactManifest = serde_json::from_str(&value.to_json().unwrap()).unwrap();
+        assert_eq!(decoded, value);
+        assert!(decoded.validate_runtime_compatibility().is_ok());
+    }
+
+    #[test]
+    fn legacy_preview1_manifest_defaults_to_core_module_format() {
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "artifact": { "name": "hello", "path": "build/hello.wasm", "sha256": "a".repeat(64), "size_bytes": 1 },
+            "build": { "language": "rust", "target": "wasm32-wasip1", "profile": "release", "fingerprint": "b".repeat(64) },
+            "runtime": { "abi": "wasi-preview1", "entrypoint": "_start" },
+            "execution": {},
+            "capabilities": ["stdio"]
+        });
+        let decoded: ArtifactManifest = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.runtime.format, ArtifactFormat::CoreModule);
+        assert!(decoded.validate_runtime_compatibility().is_ok());
+    }
+
+    #[test]
+    fn runtime_contract_rejects_abi_format_mismatch() {
+        let mut value = manifest();
+        value.runtime.abi = RuntimeAbi::wasi_preview2();
+        assert!(value.validate().is_err());
     }
 
     #[test]
@@ -406,15 +606,22 @@ mod tests {
         let root = std::env::temp_dir().join(format!("pit-artifact-{}", std::process::id()));
         let artifact_path = root.join(".pit/build/hello.wasm");
         std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
-        std::fs::write(&artifact_path, b"wasm").unwrap();
+        std::fs::write(&artifact_path, [0, 97, 115, 109, 1, 0, 0, 0]).unwrap();
         let mut value = manifest();
         value.artifact.path = "build/hello.wasm".into();
         value.artifact.sha256 = sha256_file(&artifact_path).unwrap();
-        value.artifact.size_bytes = 4;
+        value.artifact.size_bytes = 8;
         let manifest_path = root.join(".pit/artifact.json");
         value.write_atomic(&manifest_path).unwrap();
         let loaded = ArtifactManifest::load(&manifest_path).unwrap();
         assert_eq!(loaded.verify_artifact(&root).unwrap(), artifact_path);
+        let mut p2_claim = loaded.clone();
+        p2_claim.runtime = RuntimeSpec {
+            abi: RuntimeAbi::wasi_preview2(),
+            entrypoint: Entrypoint::wasi_preview2(),
+            format: ArtifactFormat::Component,
+        };
+        assert!(p2_claim.verify_artifact(&root).is_err());
         std::fs::write(&artifact_path, b"changed").unwrap();
         assert!(loaded.verify_artifact(&root).is_err());
         let _ = std::fs::remove_dir_all(root);
