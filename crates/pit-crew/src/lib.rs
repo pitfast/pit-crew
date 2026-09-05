@@ -1,20 +1,24 @@
 //! Public, CLI-independent build orchestration for PitFast.
-//!
-//! PitCrew coordinates builder adapters. It does not compile source code
-//! itself; a language-specific adapter owns toolchain and compiler details.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use pit_artifact::{ArtifactManifest, ExecutionDefaults};
+
+pub use pit_artifact::{
+    ArtifactSpec, BuildProfile, BuildSpec, Capability, RuntimeAbi, RuntimeSpec, SCHEMA_VERSION,
+    WASI_PREVIEW1_ENTRYPOINT, manifest_path, sha256_file,
+};
 
 #[derive(Debug, Clone)]
 pub struct BuildRequest {
     pub project_dir: PathBuf,
     pub bin: Option<String>,
     pub profile: BuildProfile,
+    pub execution_defaults: ExecutionDefaults,
+    pub force: bool,
 }
 
 impl BuildRequest {
@@ -23,136 +27,39 @@ impl BuildRequest {
             project_dir: project_dir.into(),
             bin: None,
             profile: BuildProfile::Release,
+            execution_defaults: ExecutionDefaults::default(),
+            force: false,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BuildProfile {
-    Debug,
-    Release,
-}
-
-impl BuildProfile {
-    pub fn cargo_directory(self) -> &'static str {
-        match self {
-            Self::Debug => "debug",
-            Self::Release => "release",
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Debug => "debug",
-            Self::Release => "release",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Language {
-    Rust,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildArtifact {
-    pub name: String,
-    pub language: Language,
-    pub target: String,
-    pub profile: BuildProfile,
+    pub manifest: ArtifactManifest,
     pub artifact_path: PathBuf,
-    pub sha256: String,
-    pub size_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArtifactManifest {
-    pub schema_version: u32,
-    pub name: String,
-    pub language: Language,
-    pub target: String,
-    pub profile: BuildProfile,
-    /// Path relative to the .pit directory.
-    pub artifact: PathBuf,
-    pub sha256: String,
-    pub size_bytes: u64,
-}
-
-impl ArtifactManifest {
-    pub const SCHEMA_VERSION: u32 = 1;
-
-    pub fn from_artifact(project_dir: &Path, artifact: &BuildArtifact) -> Result<Self> {
-        let pit_dir = project_dir.join(".pit");
-        let relative_artifact =
-            artifact
-                .artifact_path
-                .strip_prefix(&pit_dir)
-                .with_context(|| {
-                    format!(
-                        "artifact path '{}' is not inside '{}'",
-                        artifact.artifact_path.display(),
-                        pit_dir.display()
-                    )
-                })?;
+impl BuildArtifact {
+    pub fn from_manifest(project_dir: &Path, manifest: ArtifactManifest) -> Result<Self> {
+        let artifact_path = manifest.resolve_artifact_path(project_dir)?;
         Ok(Self {
-            schema_version: Self::SCHEMA_VERSION,
-            name: artifact.name.clone(),
-            language: artifact.language,
-            target: artifact.target.clone(),
-            profile: artifact.profile,
-            artifact: relative_artifact.to_path_buf(),
-            sha256: artifact.sha256.clone(),
-            size_bytes: artifact.size_bytes,
+            manifest,
+            artifact_path,
         })
     }
-
-    pub async fn read(project_dir: impl AsRef<Path>) -> Result<Self> {
-        let path = manifest_path(project_dir.as_ref());
-        let bytes = tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let manifest = serde_json::from_slice(&bytes)
-            .with_context(|| format!("malformed PitFast artifact manifest {}", path.display()))?;
-        Ok(manifest)
-    }
-
-    pub fn resolve_path(&self, project_dir: &Path) -> Result<PathBuf> {
-        if self.schema_version != Self::SCHEMA_VERSION {
-            bail!(
-                "unsupported PitFast artifact manifest schema version {}",
-                self.schema_version
-            );
-        }
-        if self.artifact.is_absolute()
-            || self
-                .artifact
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            bail!("artifact path in manifest must be relative to .pit and cannot escape it");
-        }
-        let path = project_dir.join(".pit").join(&self.artifact);
-        if !path.is_file() {
-            bail!(
-                "artifact referenced by manifest does not exist: {}",
-                path.display()
-            );
-        }
-        Ok(path)
-    }
-}
-
-pub fn manifest_path(project_dir: &Path) -> PathBuf {
-    project_dir.join(".pit").join("artifact.json")
 }
 
 #[async_trait]
 pub trait BuilderAdapter: Send + Sync {
-    fn language(&self) -> Language;
+    fn language(&self) -> &str;
     fn detect(&self, project_dir: &Path) -> bool;
-    async fn build(&self, request: &BuildRequest) -> Result<BuildArtifact>;
+    async fn fingerprint(&self, request: &BuildRequest) -> Result<String>;
+    async fn build(&self, request: &BuildRequest, fingerprint: &str) -> Result<BuildArtifact>;
+}
+
+pub struct BuildOutcome {
+    pub artifact: BuildArtifact,
+    pub reused: bool,
 }
 
 pub struct PitCrew {
@@ -169,6 +76,10 @@ impl PitCrew {
     }
 
     pub async fn build(&self, request: BuildRequest) -> Result<BuildArtifact> {
+        Ok(self.build_with_status(request).await?.artifact)
+    }
+
+    pub async fn build_with_status(&self, request: BuildRequest) -> Result<BuildOutcome> {
         let project_dir = request.project_dir.canonicalize().with_context(|| {
             format!(
                 "failed to access project directory {}",
@@ -195,64 +106,149 @@ impl PitCrew {
                     request.project_dir.display()
                 )
             })?;
+        let fingerprint = adapter
+            .fingerprint(&request)
+            .await
+            .with_context(|| format!("{} build fingerprint failed", adapter.language()))?;
+
+        if !request.force
+            && let Some(manifest) = load_valid_cached_manifest(&request, &fingerprint)
+        {
+            let mut manifest = manifest;
+            manifest.execution = request.execution_defaults.clone();
+            manifest.write_atomic(&manifest_path(&request.project_dir))?;
+            return Ok(BuildOutcome {
+                artifact: BuildArtifact::from_manifest(&request.project_dir, manifest)?,
+                reused: true,
+            });
+        }
+
         let artifact = adapter
-            .build(&request)
+            .build(&request, &fingerprint)
             .await
-            .with_context(|| format!("{} build failed", format_language(adapter.language())))?;
-        let manifest = ArtifactManifest::from_artifact(&request.project_dir, &artifact)?;
-        let manifest_path = manifest_path(&request.project_dir);
-        let manifest_json = serde_json::to_string_pretty(&manifest)? + "\n";
-        tokio::fs::create_dir_all(manifest_path.parent().unwrap_or(Path::new("."))).await?;
-        tokio::fs::write(&manifest_path, manifest_json)
-            .await
-            .with_context(|| format!("failed to write {}", manifest_path.display()))?;
-        Ok(artifact)
+            .with_context(|| format!("{} build failed", adapter.language()))?;
+        artifact.manifest.validate()?;
+        if artifact.manifest.build.fingerprint != fingerprint {
+            bail!("builder returned an artifact with a mismatched build fingerprint");
+        }
+        artifact.manifest.verify_artifact(&request.project_dir)?;
+        artifact
+            .manifest
+            .write_atomic(&manifest_path(&request.project_dir))?;
+        Ok(BuildOutcome {
+            artifact,
+            reused: false,
+        })
     }
 }
 
-fn format_language(language: Language) -> &'static str {
-    match language {
-        Language::Rust => "Rust",
+fn load_valid_cached_manifest(
+    request: &BuildRequest,
+    fingerprint: &str,
+) -> Option<ArtifactManifest> {
+    let manifest = ArtifactManifest::load(manifest_path(&request.project_dir)).ok()?;
+    if manifest.build.fingerprint != fingerprint || manifest.build.profile != request.profile {
+        return None;
     }
+    if manifest.verify_artifact(&request.project_dir).is_err() {
+        return None;
+    }
+    Some(manifest)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtifactManifest, BuildArtifact, BuildProfile, Language, manifest_path};
-    use std::path::{Path, PathBuf};
+    use super::{BuildArtifact, BuildProfile, BuildRequest, PitCrew};
+    use async_trait::async_trait;
+    use pit_artifact::{
+        ArtifactManifest, ArtifactSpec, BuildSpec, Capability, ExecutionDefaults, RuntimeAbi,
+        RuntimeSpec,
+    };
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[test]
-    fn manifest_serialization_is_stable_and_relative() {
-        let project = PathBuf::from("/tmp/project");
-        let artifact = BuildArtifact {
-            name: "hello".to_owned(),
-            language: Language::Rust,
-            target: "wasm32-wasip1".to_owned(),
-            profile: BuildProfile::Release,
-            artifact_path: project.join(".pit/build/hello.wasm"),
-            sha256: "abc".to_owned(),
-            size_bytes: 3,
-        };
-        let manifest = ArtifactManifest::from_artifact(&project, &artifact).unwrap();
-        assert_eq!(manifest_path(&project), project.join(".pit/artifact.json"));
-        assert_eq!(manifest.artifact, PathBuf::from("build/hello.wasm"));
-        let json = serde_json::to_string(&manifest).unwrap();
-        assert!(json.contains("\"schema_version\":1"));
-        assert!(json.contains("\"language\":\"rust\""));
+    struct FakeBuilder {
+        builds: Arc<AtomicUsize>,
     }
 
-    #[test]
-    fn rejects_manifest_escape_paths() {
-        let manifest = ArtifactManifest {
-            schema_version: 1,
-            name: "x".to_owned(),
-            language: Language::Rust,
-            target: "wasm32-wasip1".to_owned(),
-            profile: BuildProfile::Release,
-            artifact: PathBuf::from("../x.wasm"),
-            sha256: String::new(),
-            size_bytes: 0,
-        };
-        assert!(manifest.resolve_path(Path::new("/tmp/project")).is_err());
+    #[async_trait]
+    impl super::BuilderAdapter for FakeBuilder {
+        fn language(&self) -> &str {
+            "test"
+        }
+        fn detect(&self, project_dir: &Path) -> bool {
+            project_dir.is_dir()
+        }
+        async fn fingerprint(&self, _request: &BuildRequest) -> anyhow::Result<String> {
+            Ok("a".repeat(64))
+        }
+        async fn build(
+            &self,
+            request: &BuildRequest,
+            fingerprint: &str,
+        ) -> anyhow::Result<BuildArtifact> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            let project = &request.project_dir;
+            let dir = project.join(".pit/build");
+            std::fs::create_dir_all(&dir)?;
+            let path = dir.join("test.wasm");
+            std::fs::write(&path, b"wasm")?;
+            let manifest = ArtifactManifest {
+                schema_version: 1,
+                artifact: ArtifactSpec {
+                    name: "test".into(),
+                    path: "build/test.wasm".into(),
+                    sha256: super::sha256_file(&path)?,
+                    size_bytes: 4,
+                },
+                build: BuildSpec {
+                    language: "test".into(),
+                    target: "test".into(),
+                    profile: BuildProfile::Release,
+                    fingerprint: fingerprint.into(),
+                },
+                runtime: RuntimeSpec {
+                    abi: RuntimeAbi::wasi_preview1(),
+                    entrypoint: "_start".into(),
+                },
+                execution: ExecutionDefaults::default(),
+                capabilities: vec![Capability::stdio()],
+            };
+            Ok(BuildArtifact {
+                manifest,
+                artifact_path: path,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_build_reuses_verified_artifact() {
+        let root = std::env::temp_dir().join(format!("pit-crew-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let crew = PitCrew::with_adapter(FakeBuilder {
+            builds: Arc::clone(&builds),
+        });
+        let request = BuildRequest::new(&root);
+        assert!(
+            !crew
+                .build_with_status(request.clone())
+                .await
+                .unwrap()
+                .reused
+        );
+        assert!(crew.build_with_status(request).await.unwrap().reused);
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        std::fs::write(root.join(".pit/build/test.wasm"), b"corrupt").unwrap();
+        assert!(
+            !crew
+                .build_with_status(BuildRequest::new(&root))
+                .await
+                .unwrap()
+                .reused
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

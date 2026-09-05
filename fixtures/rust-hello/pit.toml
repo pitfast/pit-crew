@@ -1,0 +1,9 @@
+[project]
+name = "rust-hello"
+
+[build]
+# bin = "binary-name"
+
+[execution]
+timeout = "2s"
+memory = "64MiB"

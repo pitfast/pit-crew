@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/pit-artifact",
     "crates/pit-crew",
     "crates/pit-builder-rust",
 ]
