@@ -1,0 +1,6 @@
+/target
+/.pit
+/fixtures/rust-hello/.pit
+/fixtures/rust-hello/target
+/fixtures/rust-hello/Cargo.lock
+

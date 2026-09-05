@@ -1,0 +1,13 @@
+[package]
+name = "pit-crew"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PitFast source-to-WASM build orchestration API"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
