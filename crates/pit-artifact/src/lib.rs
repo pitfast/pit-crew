@@ -15,6 +15,7 @@ use wasmparser::{Encoding, Parser, Payload};
 pub const SCHEMA_VERSION: u32 = 1;
 pub const WASI_PREVIEW1_ENTRYPOINT: &str = "_start";
 pub const WASI_PREVIEW2_ENTRYPOINT: &str = "wasi:cli/command";
+pub const WASI_HTTP_PROXY_WORLD: &str = "wasi:http/proxy";
 
 pub fn manifest_path(project_dir: &Path) -> PathBuf {
     project_dir.join(".pit/artifact.json")
@@ -160,6 +161,7 @@ impl std::fmt::Display for ArtifactFormat {
 pub enum Entrypoint {
     WasiPreview1Start,
     WasiPreview2Command,
+    WasiHttpProxy,
     Custom(String),
 }
 
@@ -176,6 +178,7 @@ impl Entrypoint {
         match self {
             Self::WasiPreview1Start => WASI_PREVIEW1_ENTRYPOINT,
             Self::WasiPreview2Command => WASI_PREVIEW2_ENTRYPOINT,
+            Self::WasiHttpProxy => WASI_HTTP_PROXY_WORLD,
             Self::Custom(value) => value,
         }
     }
@@ -184,7 +187,37 @@ impl Entrypoint {
         match value.as_str() {
             WASI_PREVIEW1_ENTRYPOINT => Self::wasi_preview1(),
             WASI_PREVIEW2_ENTRYPOINT => Self::wasi_preview2(),
+            WASI_HTTP_PROXY_WORLD => Self::WasiHttpProxy,
             _ => Self::Custom(value),
+        }
+    }
+}
+
+/// Standard Component Model world implemented by a component artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ComponentWorld {
+    #[serde(rename = "wasi:cli/command")]
+    WasiCliCommand,
+    #[serde(rename = "wasi:http/proxy")]
+    WasiHttpProxy,
+}
+
+impl ComponentWorld {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WasiCliCommand => WASI_PREVIEW2_ENTRYPOINT,
+            Self::WasiHttpProxy => WASI_HTTP_PROXY_WORLD,
+        }
+    }
+}
+
+impl FromStr for ComponentWorld {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            WASI_PREVIEW2_ENTRYPOINT => Ok(Self::WasiCliCommand),
+            WASI_HTTP_PROXY_WORLD => Ok(Self::WasiHttpProxy),
+            _ => bail!("unsupported Component Model world '{value}'"),
         }
     }
 }
@@ -258,6 +291,9 @@ pub struct RuntimeSpec {
     pub entrypoint: Entrypoint,
     #[serde(default = "default_artifact_format")]
     pub format: ArtifactFormat,
+    /// The Component Model world. Omitted by legacy v0.4 command manifests.
+    #[serde(default)]
+    pub world: Option<ComponentWorld>,
 }
 
 fn default_artifact_format() -> ArtifactFormat {
@@ -331,6 +367,32 @@ impl ArtifactManifest {
                 expected_format
             );
         }
+        match self.runtime.world {
+            Some(_) if self.runtime.abi.as_str() != "wasi-preview2" => {
+                bail!("component world is only valid for wasi-preview2 artifacts")
+            }
+            Some(ComponentWorld::WasiCliCommand)
+                if self.runtime.entrypoint.as_str() != WASI_PREVIEW2_ENTRYPOINT =>
+            {
+                bail!("wasi:cli/command world requires entrypoint {WASI_PREVIEW2_ENTRYPOINT}")
+            }
+            Some(ComponentWorld::WasiHttpProxy)
+                if self.runtime.entrypoint.as_str() != WASI_HTTP_PROXY_WORLD =>
+            {
+                bail!("wasi:http/proxy world requires entrypoint {WASI_HTTP_PROXY_WORLD}")
+            }
+            None if self.runtime.abi.as_str() == "wasi-preview2"
+                && self.runtime.entrypoint.as_str() != WASI_PREVIEW2_ENTRYPOINT =>
+            {
+                bail!("legacy wasi-preview2 manifests must use {WASI_PREVIEW2_ENTRYPOINT}")
+            }
+            None if self.runtime.abi.as_str() == "wasi-preview1"
+                && self.runtime.entrypoint.as_str() != WASI_PREVIEW1_ENTRYPOINT =>
+            {
+                bail!("wasi-preview1 artifacts require entrypoint {WASI_PREVIEW1_ENTRYPOINT}")
+            }
+            _ => {}
+        }
         if self
             .capabilities
             .iter()
@@ -350,7 +412,10 @@ impl ArtifactManifest {
         }
         let expected = match self.runtime.abi.as_str() {
             "wasi-preview1" => WASI_PREVIEW1_ENTRYPOINT,
-            "wasi-preview2" => WASI_PREVIEW2_ENTRYPOINT,
+            "wasi-preview2" => match self.runtime.world {
+                Some(ComponentWorld::WasiHttpProxy) => WASI_HTTP_PROXY_WORLD,
+                _ => WASI_PREVIEW2_ENTRYPOINT,
+            },
             _ => unreachable!(),
         };
         if self.runtime.entrypoint.as_str() != expected {
@@ -523,6 +588,7 @@ mod tests {
                 abi: RuntimeAbi::wasi_preview1(),
                 entrypoint: Entrypoint::wasi_preview1(),
                 format: ArtifactFormat::CoreModule,
+                world: None,
             },
             execution: ExecutionDefaults::default(),
             capabilities: vec![Capability::stdio(), Capability::args(), Capability::env()],
@@ -573,6 +639,7 @@ mod tests {
             abi: RuntimeAbi::wasi_preview2(),
             entrypoint: Entrypoint::wasi_preview2(),
             format: ArtifactFormat::Component,
+            world: Some(ComponentWorld::WasiCliCommand),
         };
         let decoded: ArtifactManifest = serde_json::from_str(&value.to_json().unwrap()).unwrap();
         assert_eq!(decoded, value);
@@ -620,6 +687,7 @@ mod tests {
             abi: RuntimeAbi::wasi_preview2(),
             entrypoint: Entrypoint::wasi_preview2(),
             format: ArtifactFormat::Component,
+            world: Some(ComponentWorld::WasiCliCommand),
         };
         assert!(p2_claim.verify_artifact(&root).is_err());
         std::fs::write(&artifact_path, b"changed").unwrap();

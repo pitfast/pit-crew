@@ -3,6 +3,10 @@
 PitCrew is the PitFast source-to-WASM build system. It is a build orchestrator,
 not a compiler:
 
+Rust HTTP projects may declare the standard `wasi:http/proxy` world in
+`pit.toml`; PitCrew writes that world to the generated artifact manifest and
+does not execute it. Rust remains the only supported source language.
+
 ~~~text
 source project → builder adapter → WASM → .pit artifact
 ~~~

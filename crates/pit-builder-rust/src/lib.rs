@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use pit_artifact::{
     ArtifactFormat, ArtifactManifest, ArtifactSpec, BuildProfile, BuildSpec, Capability,
-    Entrypoint, RuntimeAbi, RuntimeSpec, SCHEMA_VERSION,
+    ComponentWorld, Entrypoint, RuntimeAbi, RuntimeSpec, SCHEMA_VERSION,
 };
 use pit_crew::{BuildArtifact, BuildRequest, BuilderAdapter};
 use serde::Deserialize;
@@ -15,6 +15,13 @@ use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
 const BUILDER_CONTRACT: &str = "pit-builder-rust-v1";
+
+fn effective_world(request: &BuildRequest) -> Option<ComponentWorld> {
+    match request.abi.as_str() {
+        "wasi-preview2" => Some(request.world.unwrap_or(ComponentWorld::WasiCliCommand)),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RustBuilder;
@@ -71,7 +78,12 @@ impl RustBuilder {
                 package
                     .targets
                     .iter()
-                    .filter(|target| target.kind.iter().any(|kind| kind == "bin"))
+                    .filter(|target| {
+                        target
+                            .kind
+                            .iter()
+                            .any(|kind| kind == "bin" || kind == "cdylib")
+                    })
                     .map(|target| target.name.as_str())
             })
             .collect::<Vec<_>>();
@@ -135,11 +147,20 @@ impl RustBuilder {
         }
 
         let metadata = Self::metadata(&request.project_dir).await?;
-        let path = metadata
+        let base = metadata
             .target_directory
             .join(target)
             .join(request.profile.cargo_directory())
             .join(format!("{name}.wasm"));
+        let path = if base.is_file() {
+            base
+        } else {
+            metadata
+                .target_directory
+                .join(target)
+                .join(request.profile.cargo_directory())
+                .join(format!("{}.wasm", name.replace('-', "_")))
+        };
         if !path.is_file() {
             bail!(
                 "cargo build succeeded but expected WASM artifact was not found: {}",
@@ -176,6 +197,10 @@ impl BuilderAdapter for RustBuilder {
             name.as_str(),
         ] {
             hasher.update(value.as_bytes());
+            hasher.update([0]);
+        }
+        if let Some(world) = effective_world(request) {
+            hasher.update(world.as_str().as_bytes());
             hasher.update([0]);
         }
         for path in Self::fingerprint_files(&metadata.workspace_root)? {
@@ -218,7 +243,7 @@ impl BuilderAdapter for RustBuilder {
                 profile: request.profile,
                 fingerprint: fingerprint.to_owned(),
             },
-            runtime: runtime_spec(&request.abi),
+            runtime: runtime_spec(&request.abi, effective_world(request)),
             execution: request.execution_defaults.clone(),
             capabilities: vec![Capability::stdio(), Capability::args(), Capability::env()],
         };
@@ -306,22 +331,28 @@ pub async fn validate_wasm(path: impl AsRef<Path>, abi: &RuntimeAbi) -> Result<(
     Ok(())
 }
 
-fn runtime_spec(abi: &RuntimeAbi) -> RuntimeSpec {
+fn runtime_spec(abi: &RuntimeAbi, world: Option<ComponentWorld>) -> RuntimeSpec {
     match abi.as_str() {
         "wasi-preview1" => RuntimeSpec {
             abi: abi.clone(),
             entrypoint: Entrypoint::wasi_preview1(),
             format: ArtifactFormat::CoreModule,
+            world: None,
         },
         "wasi-preview2" => RuntimeSpec {
             abi: abi.clone(),
-            entrypoint: Entrypoint::wasi_preview2(),
+            entrypoint: match world {
+                Some(ComponentWorld::WasiHttpProxy) => Entrypoint::WasiHttpProxy,
+                _ => Entrypoint::wasi_preview2(),
+            },
             format: ArtifactFormat::Component,
+            world,
         },
         _ => RuntimeSpec {
             abi: abi.clone(),
             entrypoint: Entrypoint::Custom(String::new()),
             format: ArtifactFormat::CoreModule,
+            world: None,
         },
     }
 }

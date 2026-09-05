@@ -8,9 +8,9 @@ use async_trait::async_trait;
 use pit_artifact::{ArtifactManifest, ExecutionDefaults};
 
 pub use pit_artifact::{
-    ArtifactFormat, ArtifactSpec, BuildProfile, BuildSpec, Capability, Entrypoint, RuntimeAbi,
-    RuntimeSpec, SCHEMA_VERSION, WASI_PREVIEW1_ENTRYPOINT, WASI_PREVIEW2_ENTRYPOINT, manifest_path,
-    sha256_file,
+    ArtifactFormat, ArtifactSpec, BuildProfile, BuildSpec, Capability, ComponentWorld, Entrypoint,
+    RuntimeAbi, RuntimeSpec, SCHEMA_VERSION, WASI_PREVIEW1_ENTRYPOINT, WASI_PREVIEW2_ENTRYPOINT,
+    manifest_path, sha256_file,
 };
 
 #[derive(Debug, Clone)]
@@ -19,6 +19,7 @@ pub struct BuildRequest {
     pub bin: Option<String>,
     pub profile: BuildProfile,
     pub abi: RuntimeAbi,
+    pub world: Option<ComponentWorld>,
     pub execution_defaults: ExecutionDefaults,
     pub force: bool,
 }
@@ -30,6 +31,7 @@ impl BuildRequest {
             bin: None,
             profile: BuildProfile::Release,
             abi: RuntimeAbi::wasi_preview2(),
+            world: None,
             execution_defaults: ExecutionDefaults::default(),
             force: false,
         }
@@ -154,6 +156,9 @@ fn load_valid_cached_manifest(
         || manifest.build.profile != request.profile
         || manifest.build.target != request.abi.target().unwrap_or_default()
         || manifest.runtime.abi != request.abi
+        || (request.abi.as_str() == "wasi-preview2"
+            && manifest.runtime.world
+                != Some(request.world.unwrap_or(ComponentWorld::WasiCliCommand)))
     {
         return None;
     }
@@ -219,6 +224,7 @@ mod tests {
                     abi: RuntimeAbi::wasi_preview1(),
                     entrypoint: Entrypoint::wasi_preview1(),
                     format: ArtifactFormat::CoreModule,
+                    world: None,
                 },
                 execution: ExecutionDefaults::default(),
                 capabilities: vec![Capability::stdio()],
