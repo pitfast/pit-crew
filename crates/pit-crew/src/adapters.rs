@@ -193,10 +193,11 @@ impl StaticWebAdapter {
     }
 
     fn output_dir(project: &Path) -> Option<PathBuf> {
-        ["dist", "build", "out"]
+        ["dist", "build", "out", ".output/public", "build/client"]
             .into_iter()
             .map(|name| project.join(name))
-            .find(|path| path.is_dir())
+            .filter(|path| path.is_dir())
+            .find_map(|path| static_root_with_index(&path))
     }
 }
 
@@ -260,6 +261,7 @@ impl ApplicationAdapter for StaticWebAdapter {
         }
         let root = project.root.join(".pit/generated/adapters/static-web");
         std::fs::create_dir_all(&root)?;
+        let wit_path = write_static_web_wit(&root)?;
         let bridge = static_web_bridge(&assets)?;
         let bridge_path = root.join("main.js");
         std::fs::write(&bridge_path, bridge.as_bytes())?;
@@ -276,7 +278,7 @@ impl ApplicationAdapter for StaticWebAdapter {
             workspace: AdapterWorkspace {
                 root: root.clone(),
                 source_roots: vec![root.clone()],
-                wit_path: None,
+                wit_path: Some(wit_path),
                 entrypoint: "main.js".into(),
                 adapter: self.id.clone(),
                 digest,
@@ -806,6 +808,185 @@ fn collect_static_assets(
     Ok(())
 }
 
+/// The static adapter is intended to work on an ordinary frontend checkout,
+/// which normally has no WIT directory. Keep the standard HTTP world in the
+/// built-in adapter instead of requiring developers to copy componentization
+/// fixtures into every frontend project.
+fn write_static_web_wit(root: &Path) -> Result<PathBuf> {
+    const FILES: &[(&str, &[u8])] = &[
+        (
+            "deps.toml",
+            include_bytes!("../../../fixtures/static-web/wit/deps.toml"),
+        ),
+        (
+            "deps.lock",
+            include_bytes!("../../../fixtures/static-web/wit/deps.lock"),
+        ),
+        (
+            "handler.wit",
+            include_bytes!("../../../fixtures/static-web/wit/handler.wit"),
+        ),
+        (
+            "proxy.wit",
+            include_bytes!("../../../fixtures/static-web/wit/proxy.wit"),
+        ),
+        (
+            "types.wit",
+            include_bytes!("../../../fixtures/static-web/wit/types.wit"),
+        ),
+        (
+            "deps/cli/command.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/cli/command.wit"),
+        ),
+        (
+            "deps/cli/environment.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/cli/environment.wit"),
+        ),
+        (
+            "deps/cli/exit.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/cli/exit.wit"),
+        ),
+        (
+            "deps/cli/imports.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/cli/imports.wit"),
+        ),
+        (
+            "deps/cli/run.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/cli/run.wit"),
+        ),
+        (
+            "deps/cli/stdio.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/cli/stdio.wit"),
+        ),
+        (
+            "deps/cli/terminal.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/cli/terminal.wit"),
+        ),
+        (
+            "deps/clocks/monotonic-clock.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/clocks/monotonic-clock.wit"),
+        ),
+        (
+            "deps/clocks/wall-clock.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/clocks/wall-clock.wit"),
+        ),
+        (
+            "deps/clocks/world.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/clocks/world.wit"),
+        ),
+        (
+            "deps/filesystem/preopens.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/filesystem/preopens.wit"),
+        ),
+        (
+            "deps/filesystem/types.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/filesystem/types.wit"),
+        ),
+        (
+            "deps/filesystem/world.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/filesystem/world.wit"),
+        ),
+        (
+            "deps/io/error.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/io/error.wit"),
+        ),
+        (
+            "deps/io/poll.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/io/poll.wit"),
+        ),
+        (
+            "deps/io/streams.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/io/streams.wit"),
+        ),
+        (
+            "deps/io/world.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/io/world.wit"),
+        ),
+        (
+            "deps/random/insecure-seed.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/random/insecure-seed.wit"),
+        ),
+        (
+            "deps/random/insecure.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/random/insecure.wit"),
+        ),
+        (
+            "deps/random/random.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/random/random.wit"),
+        ),
+        (
+            "deps/random/world.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/random/world.wit"),
+        ),
+        (
+            "deps/sockets/instance-network.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/sockets/instance-network.wit"),
+        ),
+        (
+            "deps/sockets/ip-name-lookup.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/sockets/ip-name-lookup.wit"),
+        ),
+        (
+            "deps/sockets/network.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/sockets/network.wit"),
+        ),
+        (
+            "deps/sockets/tcp-create-socket.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/sockets/tcp-create-socket.wit"),
+        ),
+        (
+            "deps/sockets/tcp.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/sockets/tcp.wit"),
+        ),
+        (
+            "deps/sockets/udp-create-socket.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/sockets/udp-create-socket.wit"),
+        ),
+        (
+            "deps/sockets/udp.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/sockets/udp.wit"),
+        ),
+        (
+            "deps/sockets/world.wit",
+            include_bytes!("../../../fixtures/static-web/wit/deps/sockets/world.wit"),
+        ),
+    ];
+    let wit = root.join("wit");
+    for (relative, bytes) in FILES {
+        let path = wit.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, bytes)?;
+    }
+    Ok(wit)
+}
+
+fn static_root_with_index(root: &Path) -> Option<PathBuf> {
+    if root.join("index.html").is_file() {
+        return Some(root.to_path_buf());
+    }
+
+    let mut directories = vec![root.to_path_buf()];
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for directory in directories {
+            let entries = std::fs::read_dir(&directory).ok()?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.join("index.html").is_file() {
+                        return Some(path);
+                    }
+                    next.push(path);
+                }
+            }
+        }
+        directories = next;
+    }
+    None
+}
+
 fn static_content_type(path: &str) -> &'static str {
     match path
         .rsplit('.')
@@ -855,6 +1036,12 @@ function response(path, status, body, type) {{
   return new Response(body, {{ status, headers }});
 }}
 
+function writeBytes(stream, bytes) {{
+  for (let offset = 0; offset < bytes.length; offset += 1024) {{
+    stream.blockingWriteAndFlush(bytes.slice(offset, offset + 1024));
+  }}
+}}
+
 export const incomingHandler = {{
   async handle(request, responseOutparam) {{
     const pathWithQuery = request.pathWithQuery() ?? '/';
@@ -889,7 +1076,7 @@ export const incomingHandler = {{
     outgoing.setStatusCode(200);
     const body = outgoing.body();
     const stream = body.write();
-    stream.blockingWriteAndFlush(asset.bytes);
+    writeBytes(stream, asset.bytes);
     stream[Symbol.dispose]();
     OutgoingBody.finish(body, undefined);
     ResponseOutparam.set(responseOutparam, {{ tag: 'ok', val: outgoing }});

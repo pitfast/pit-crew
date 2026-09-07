@@ -1,0 +1,10 @@
+schema = 1
+name = "pitfast-react-static-example"
+
+[service]
+build = "."
+language = "javascript"
+interface = "static-web"
+
+[routes]
+"/" = "pitfast-react-static-example"

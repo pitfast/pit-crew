@@ -44,17 +44,20 @@ impl JsBuilder {
         std::env::var("PITFAST_COMPONENTIZE_JS_SCRIPT").ok()
     }
     fn wit(request: &BuildRequest) -> Result<PathBuf> {
-        let path = request.project_dir.join("wit");
-        if path.is_dir() {
-            Ok(path)
-        } else {
-            std::env::var_os("PITFAST_HTTP_WIT")
-                .map(PathBuf::from)
-                .filter(|p| p.exists())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("JavaScript builder needs project/wit or PITFAST_HTTP_WIT")
-                })
-        }
+        request
+            .wit_path
+            .clone()
+            .filter(|path| path.is_dir())
+            .or_else(|| {
+                let path = request.project_dir.join("wit");
+                path.is_dir().then_some(path)
+            })
+            .or_else(|| {
+                std::env::var_os("PITFAST_HTTP_WIT")
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_dir())
+            })
+            .ok_or_else(|| anyhow::anyhow!("JavaScript builder needs a WIT package"))
     }
     fn source(&self, root: &Path) -> Result<PathBuf> {
         let path = match self.language {
@@ -159,7 +162,15 @@ impl LanguageBuilder for JsBuilder {
                         }
                     }
             });
-        let marker = project_dir.join("package.json").is_file() && has_source;
+        // Static-web adapters generate the component entrypoint themselves.
+        // A TypeScript frontend such as Angular may not have a root-level
+        // `main.ts`, so its production output is also a valid builder marker.
+        let has_static_output = ["dist", "build", "out", ".output/public"]
+            .into_iter()
+            .map(|name| project_dir.join(name))
+            .any(|path| path.join("index.html").is_file() || path.is_dir());
+        let marker =
+            project_dir.join("package.json").is_file() && (has_source || has_static_output);
         if marker {
             Detection::Yes
         } else {
@@ -211,11 +222,7 @@ impl LanguageBuilder for JsBuilder {
         }
         let wit = Self::wit(request)?;
         let source = if let Some(adapter) = &request.adapter_workspace {
-            if self.language == Language::JavaScript {
-                adapter.root.join(&adapter.entrypoint)
-            } else {
-                self.source(&request.project_dir)?
-            }
+            adapter.root.join(&adapter.entrypoint)
         } else {
             self.source(&request.project_dir)?
         };
@@ -225,40 +232,41 @@ impl LanguageBuilder for JsBuilder {
         let build_dir = pit_dir.join("build");
         tokio::fs::create_dir_all(&generated).await?;
         tokio::fs::create_dir_all(&build_dir).await?;
-        let compiled_source = if self.language == Language::TypeScript {
-            let mut tsc = Command::new(Self::tsc());
-            tsc.args([
-                source.to_str().unwrap_or("main.ts"),
-                "--target",
-                "ES2022",
-                "--module",
-                "ES2022",
-                "--moduleResolution",
-                "node",
-                "--lib",
-                "ESNext,DOM",
-                "--skipLibCheck",
-            ]);
-            let declarations = request.project_dir.join("wasi-http.d.ts");
-            if declarations.is_file() {
-                tsc.arg(&declarations);
-            }
-            let output = tsc
-                .args(["--outDir"])
-                .arg(&generated)
-                .output()
-                .await
-                .context("failed to run TypeScript compiler")?;
-            if !output.status.success() {
-                bail!(
-                    "TypeScript compilation failed: {}",
-                    text(&output.stdout, &output.stderr)
-                );
-            }
-            generated.join("main.js")
-        } else {
-            source.clone()
-        };
+        let compiled_source =
+            if self.language == Language::TypeScript && request.adapter_workspace.is_none() {
+                let mut tsc = Command::new(Self::tsc());
+                tsc.args([
+                    source.to_str().unwrap_or("main.ts"),
+                    "--target",
+                    "ES2022",
+                    "--module",
+                    "ES2022",
+                    "--moduleResolution",
+                    "node",
+                    "--lib",
+                    "ESNext,DOM",
+                    "--skipLibCheck",
+                ]);
+                let declarations = request.project_dir.join("wasi-http.d.ts");
+                if declarations.is_file() {
+                    tsc.arg(&declarations);
+                }
+                let output = tsc
+                    .args(["--outDir"])
+                    .arg(&generated)
+                    .output()
+                    .await
+                    .context("failed to run TypeScript compiler")?;
+                if !output.status.success() {
+                    bail!(
+                        "TypeScript compilation failed: {}",
+                        text(&output.stdout, &output.stderr)
+                    );
+                }
+                generated.join("main.js")
+            } else {
+                source.clone()
+            };
         let js_source = request
             .adapter_workspace
             .as_ref()

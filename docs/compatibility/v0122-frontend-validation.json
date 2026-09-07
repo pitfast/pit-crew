@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "host": {"os": "Debian GNU/Linux 13.6", "architecture": "x86_64", "node": "v24.20.0", "pnpm": "12.3.4"},
+  "adapter": "static/web -> wasi:http/proxy",
+  "entries": [
+    {"framework":"React","version":"19.2.8","mode":"static","build":"pnpm build","output":"dist","status":"PASS_STATIC","pitfast_e2e":true,"browser_e2e":true,"notes":"Vite production output; GET / and JS/CSS assets served."},
+    {"framework":"Vue","version":"3.5.42","mode":"static","build":"pnpm build","output":"dist","status":"PASS_STATIC","pitfast_e2e":true,"browser_e2e":true,"notes":"Vite production output; GET / and CSS/JS assets served."},
+    {"framework":"Angular","version":"22.1.5","mode":"static","build":"pnpm build","output":"dist/angular/browser","status":"PASS_STATIC","pitfast_e2e":true,"browser_e2e":true,"notes":"Nested Angular browser output discovered without a framework runtime branch."},
+    {"framework":"Svelte","version":"5.57.0","mode":"static","build":"pnpm build","output":"dist","status":"PASS_STATIC","pitfast_e2e":true,"browser_e2e":true,"notes":"Vite production output; GET / and CSS/JS assets served."},
+    {"framework":"Solid","version":"1.9.15","mode":"static","build":"pnpm build","output":"dist","status":"PASS_STATIC","pitfast_e2e":true,"browser_e2e":false,"notes":"Vite production output; HTTP E2E passed."},
+    {"framework":"Preact","version":"10.29.8","mode":"static","build":"pnpm build","output":"dist","status":"PASS_STATIC","pitfast_e2e":true,"browser_e2e":false,"notes":"Vite production output; HTTP E2E passed."},
+    {"framework":"Next.js","version":"16.3.4","mode":"static-export","build":"pnpm build with output=export","output":"out","status":"PASS_STATIC","pitfast_e2e":true,"browser_e2e":false,"notes":"Static export is compatible; Node SSR is not claimed."},
+    {"framework":"Next.js","version":"16.3.4","mode":"ssr","status":"BLOCKED_PROCESS_MODEL","pitfast_e2e":false,"notes":"next start requires a persistent Node server; no host-process fallback is used."},
+    {"framework":"Nuxt","version":"4.5.2","mode":"static-generate","build":"pnpm generate","output":".output/public","status":"PASS_STATIC","pitfast_e2e":true,"browser_e2e":false,"notes":"Nitro static output served by the same adapter."},
+    {"framework":"Nuxt","version":"4.5.2","mode":"ssr","status":"BLOCKED_PROCESS_MODEL","pitfast_e2e":false,"notes":"Nitro Node server mode is not a WASI workload in this milestone."},
+    {"framework":"SvelteKit","version":"2.70.3","mode":"static","build":"pnpm build with adapter-static and prerender","output":"build","status":"PASS_STATIC","pitfast_e2e":true,"browser_e2e":false,"notes":"Official adapter-static output."},
+    {"framework":"SvelteKit","version":"2.70.3","mode":"ssr","status":"BLOCKED_PROCESS_MODEL","pitfast_e2e":false,"notes":"SSR adapter requires a server runtime not present in the static-web contract."},
+    {"framework":"Astro","version":"7.3.1","mode":"static","build":"pnpm build","output":"dist","status":"PASS_STATIC","pitfast_e2e":true,"browser_e2e":false,"notes":"Official static output."},
+    {"framework":"Astro","version":"7.3.1","mode":"ssr","status":"BLOCKED_PROCESS_MODEL","pitfast_e2e":false,"notes":"SSR adapter/server mode was not executed as a WASI workload."},
+    {"framework":"mystery-static-framework","version":"fixture","mode":"static","status":"PASS_WITH_CONFIGURATION","pitfast_e2e":true,"browser_e2e":false,"notes":"Unknown framework name, manually configured static-web, same adapter."}
+  ]
+}

@@ -292,6 +292,7 @@ impl PitCrew {
                 bail!(format_compatibility_error(&compatibility));
             }
             let output = adapter.prepare(&project_inspection, &model)?;
+            request.wit_path = output.workspace.wit_path.clone();
             request.adapter_workspace = Some(output.workspace);
         } else if request.application_interface.is_none() {
             request.application_interface = Some(default_interface(&request));

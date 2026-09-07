@@ -1,7 +1,8 @@
 # PitFast web compatibility census
 
 This is an engineering evidence record, not a claim that PitFast runs every
-framework. The machine-readable source is
+framework. The v0.12.2 frontend run used user-local Node `v24.20.0` and pnpm
+`12.3.4`. The machine-readable source is
 [`web-frameworks.json`](./web-frameworks.json). A framework is counted as a
 pass only when its resulting artifact was executed through PitFast/PitBox.
 
@@ -15,25 +16,27 @@ pass only when its resulting artifact was executed through PitFast/PitBox.
 | Go `net/http` | `go/net-http`; plain `net/http` and Chi fixtures pass |
 | Raw WASI Component | bypasses framework and toolchain detection |
 
-The static adapter was tested with a real `dist/` fixture. It served
-`index.html`, nested CSS and JavaScript, returned MIME types, returned 404 for
-missing files, and rejected `..` path segments. It does not start Node, nginx,
-or a framework server at runtime.
+The static adapter was tested with real React, Vue, Angular, Svelte, Solid,
+Preact, Next static export, Nuxt generate, SvelteKit adapter-static, and Astro
+static output. It served `index.html`, nested CSS and JavaScript, returned MIME
+types, returned 404 for missing files, and rejected `..` path segments. React,
+Vue, Angular, and Svelte also booted in headless Chromium from PitFast with no
+fatal console errors. It does not start Node, nginx, or a framework server at
+runtime.
 
 ## Current census summary
 
-The current JSON contains 91 explicit records: 5 executed passes (one static,
-four generic-adapter proofs), 1 confirmed native-extension blocker, 25
-language-toolchain blockers, 8 process-model blockers, 7 runtime-API blockers,
-14 fixture-specific investigations still untested, and 31 environment-unavailable
-records. No environment-unavailable record is counted as support.
+The current JSON contains 91 explicit records. The mandatory frontend entries
+are executed evidence; optional ecosystems remain explicitly marked
+`UNTESTED_ENVIRONMENT` where no real fixture was built. No untested record is
+counted as support.
 
 | Area | Classification |
 | --- | --- |
-| React, Vue, Angular, Svelte, Solid, Preact, Qwik, Lit, Alpine, HTMX | Environment unavailable in this run: no native Node package manager to create production fixtures |
-| Next/Nuxt/SvelteKit/Astro static modes | Same generic `static-web` boundary; package builds unavailable in this run |
+| React, Vue, Angular, Svelte, Solid, Preact | Real production builds and PitFast HTTP E2E pass through one `static-web` adapter; React/Vue/Angular/Svelte also pass browser boot |
+| Next/Nuxt/SvelteKit/Astro static modes | Real static/export builds and PitFast HTTP E2E pass through the same generic `static-web` adapter |
 | Next/Nuxt/SvelteKit/Astro SSR modes | Blocked by the current process/runtime model unless a future generic WASI server interface is implemented |
-| Hono | Fetch-compatible in principle; real package fixture unavailable in this run |
+| Hono | Fetch-compatible in principle; existing generic Fetch adapter passes unknown/plain fixtures, but Hono package was not separately built in this run |
 | Express/Fastify/Nest/Koa/Adonis | Node server APIs/process model; no host-Node fallback |
 | Starlette/Falcon/unknown ASGI | Pass through one generic adapter |
 | FastAPI | ASGI boundary is present, but `fastapi → pydantic → pydantic_core` requires an unavailable Linux CPython native extension |
