@@ -1,0 +1,4 @@
+[build]
+language = "javascript"
+interface = "static-web"
+abi = "wasi-preview2"

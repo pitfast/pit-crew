@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "artifact": {
+    "name": "static_web",
+    "path": "build/static_web.wasm",
+    "sha256": "3a5d759d83b81d24e0f85ff91a2df4af159a19f80e11d563a0f0e2791f4d9d90",
+    "size_bytes": 14454296
+  },
+  "build": {
+    "language": "javascript",
+    "target": "wasm32-wasip2",
+    "profile": "release",
+    "fingerprint": "6786e6e8f96a6a14e626cce6abc532372730a561bedeb4e3a578655cdcdd4f1c",
+    "toolchain": "componentize-js",
+    "toolchain_version": "0.22.0",
+    "application_interface": "static-web",
+    "adapter": "static/web",
+    "adapter_digest": "sha256:9639c8e590957a3478a63b5b368c1bf7fa56285c549adca80130af68e7e00e3f"
+  },
+  "runtime": {
+    "abi": "wasi-preview2",
+    "entrypoint": "wasi:http/proxy",
+    "format": "component",
+    "world": "wasi:http/proxy"
+  },
+  "execution": {
+    "timeout_ms": null,
+    "memory_bytes": null
+  },
+  "capabilities": [
+    "stdio",
+    "args",
+    "env"
+  ]
+}

@@ -1,0 +1,10 @@
+schema = 1
+name = "static-web-fixture"
+
+[service]
+build = "."
+language = "javascript"
+interface = "static-web"
+
+[routes]
+"/" = "static-web-fixture"

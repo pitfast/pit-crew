@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 const ASGI_ADAPTER_VERSION: &str = "python/asgi-v1";
 const FETCH_ADAPTER_VERSION: &str = "javascript-fetch-v1";
 const GO_NET_HTTP_ADAPTER_VERSION: &str = "go/net-http-v1";
+const STATIC_WEB_ADAPTER_VERSION: &str = "static-web-v1";
 
 #[derive(Debug, Clone)]
 pub struct PythonAsgiAdapter {
@@ -153,6 +154,128 @@ impl ApplicationAdapter for JavaScriptFetchAdapter {
             workspace: AdapterWorkspace {
                 root: root.clone(),
                 source_roots: vec![root.clone(), project.root.clone()],
+                wit_path: None,
+                entrypoint: "main.js".into(),
+                adapter: self.id.clone(),
+                digest,
+                generated_files: digest_files
+                    .into_iter()
+                    .map(|(path, _)| root.join(path))
+                    .collect(),
+            },
+            runtime_world: self.runtime_world(),
+        })
+    }
+}
+
+/// Generic adapter for a prebuilt browser/static output directory. It embeds
+/// the files into a small Fetch handler, so Node and the frontend framework
+/// are build-time concerns only.
+#[derive(Debug, Clone)]
+pub struct StaticWebAdapter {
+    language: Language,
+    id: AdapterId,
+    interface: ApplicationInterface,
+}
+
+impl StaticWebAdapter {
+    pub fn new(language: Language) -> Self {
+        assert!(matches!(
+            language,
+            Language::JavaScript | Language::TypeScript
+        ));
+        Self {
+            language,
+            id: AdapterId::new("static/web").expect("built-in adapter id is valid"),
+            interface: ApplicationInterface::new("static-web")
+                .expect("built-in interface id is valid"),
+        }
+    }
+
+    fn output_dir(project: &Path) -> Option<PathBuf> {
+        ["dist", "build", "out"]
+            .into_iter()
+            .map(|name| project.join(name))
+            .find(|path| path.is_dir())
+    }
+}
+
+impl ApplicationAdapter for StaticWebAdapter {
+    fn id(&self) -> AdapterId {
+        self.id.clone()
+    }
+
+    fn language(&self) -> Language {
+        self.language
+    }
+
+    fn interface(&self) -> &ApplicationInterface {
+        &self.interface
+    }
+
+    fn runtime_world(&self) -> ComponentWorld {
+        ComponentWorld::WasiHttpProxy
+    }
+
+    fn detect(&self, project: &ProjectInspection) -> Option<DetectionCandidate> {
+        if !project.has_file("package.json") || Self::output_dir(&project.root).is_none() {
+            return None;
+        }
+        Some(DetectionCandidate {
+            language: self.language,
+            application_interface: Some(self.interface.clone()),
+            entrypoint: None,
+            framework_hint: None,
+            confidence: 80,
+            evidence: vec![DetectionEvidence {
+                source: "package.json/static output".into(),
+                detail: "static-web output directory detected".into(),
+            }],
+        })
+    }
+
+    fn validate(&self, model: &ProjectModel) -> Result<CompatibilityReport> {
+        if model.language != self.language {
+            bail!("adapter '{}' requires {}", self.id, self.language);
+        }
+        if model.application_interface.as_ref() != Some(&self.interface) {
+            bail!("adapter '{}' requires the static-web interface", self.id);
+        }
+        Ok(CompatibilityReport::supported(
+            "static assets are embedded into a generic wasi:http/proxy Component",
+        ))
+    }
+
+    fn prepare(&self, project: &ProjectInspection, model: &ProjectModel) -> Result<AdapterOutput> {
+        self.validate(model)?;
+        let output = Self::output_dir(&project.root).ok_or_else(|| {
+            anyhow::anyhow!(
+                "static-web adapter requires a dist/, build/, or out/ directory; run the frontend production build first"
+            )
+        })?;
+        let mut assets = Vec::new();
+        collect_static_assets(&output, &output, &mut assets)?;
+        if assets.is_empty() {
+            bail!("static-web output directory is empty: {}", output.display());
+        }
+        let root = project.root.join(".pit/generated/adapters/static-web");
+        std::fs::create_dir_all(&root)?;
+        let bridge = static_web_bridge(&assets)?;
+        let bridge_path = root.join("main.js");
+        std::fs::write(&bridge_path, bridge.as_bytes())?;
+        let mut digest_files = Vec::new();
+        collect_files(&root, &root, &mut digest_files)?;
+        let digest = adapter_digest_bytes(
+            STATIC_WEB_ADAPTER_VERSION,
+            &self.id,
+            &self.interface,
+            "static-web",
+            &digest_files,
+        );
+        Ok(AdapterOutput {
+            workspace: AdapterWorkspace {
+                root: root.clone(),
+                source_roots: vec![root.clone()],
                 wit_path: None,
                 entrypoint: "main.js".into(),
                 adapter: self.id.clone(),
@@ -649,6 +772,131 @@ fn split_entrypoint(entrypoint: &str) -> Result<(&str, &str)> {
         bail!("entrypoint contains an invalid module or attribute");
     }
     Ok((module, attribute))
+}
+
+fn collect_static_assets(
+    root: &Path,
+    current: &Path,
+    assets: &mut Vec<(String, Vec<u8>)>,
+) -> Result<()> {
+    let canonical_root = root.canonicalize()?;
+    for entry in std::fs::read_dir(current)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_static_assets(root, &path, assets)?;
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let canonical = path.canonicalize()?;
+        if !canonical.starts_with(&canonical_root) {
+            bail!(
+                "static-web asset escapes output directory: {}",
+                path.display()
+            );
+        }
+        let relative = path
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        assets.push((format!("/{relative}"), std::fs::read(path)?));
+    }
+    assets.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(())
+}
+
+fn static_content_type(path: &str) -> &'static str {
+    match path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "ico" => "image/x-icon",
+        "webp" => "image/webp",
+        "wasm" => "application/wasm",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn static_web_bridge(assets: &[(String, Vec<u8>)]) -> Result<String> {
+    let mut entries = String::new();
+    for (path, bytes) in assets {
+        let path = serde_json::to_string(path)?;
+        let content_type = serde_json::to_string(static_content_type(path.trim_matches('"')))?;
+        let bytes = bytes
+            .iter()
+            .map(|byte| byte.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        entries.push_str(&format!(
+            "  [{path}, {{ type: {content_type}, bytes: new Uint8Array([{bytes}]) }}],\n"
+        ));
+    }
+    Ok(format!(
+        r#"import {{ IncomingBody, OutgoingBody, OutgoingResponse, Fields, ResponseOutparam }} from 'wasi:http/types@0.2.0';
+
+const assets = new Map([
+{entries}]);
+
+function response(path, status, body, type) {{
+  const headers = new Headers({{ 'content-type': type }});
+  return new Response(body, {{ status, headers }});
+}}
+
+export const incomingHandler = {{
+  async handle(request, responseOutparam) {{
+    const pathWithQuery = request.pathWithQuery() ?? '/';
+    const encodedPath = pathWithQuery.split('?', 1)[0];
+    let path;
+    try {{ path = decodeURIComponent(encodedPath); }} catch (_) {{ path = encodedPath; }}
+    if (path.split('/').includes('..')) {{
+      const result = response(path, 404, 'not found', 'text/plain; charset=utf-8');
+      const outgoing = new OutgoingResponse(Fields.fromList([['content-type', new TextEncoder().encode('text/plain; charset=utf-8')]]));
+      outgoing.setStatusCode(result.status);
+      const body = outgoing.body();
+      const stream = body.write();
+      stream.blockingWriteAndFlush(new TextEncoder().encode('not found'));
+      stream[Symbol.dispose]();
+      OutgoingBody.finish(body, undefined);
+      ResponseOutparam.set(responseOutparam, {{ tag: 'ok', val: outgoing }});
+      return;
+    }}
+    const asset = assets.get(path) ?? (path.endsWith('/') ? assets.get(path + 'index.html') : undefined);
+    if (!asset) {{
+      const outgoing = new OutgoingResponse(Fields.fromList([['content-type', new TextEncoder().encode('text/plain; charset=utf-8')]]));
+      outgoing.setStatusCode(404);
+      const body = outgoing.body();
+      const stream = body.write();
+      stream.blockingWriteAndFlush(new TextEncoder().encode('not found'));
+      stream[Symbol.dispose]();
+      OutgoingBody.finish(body, undefined);
+      ResponseOutparam.set(responseOutparam, {{ tag: 'ok', val: outgoing }});
+      return;
+    }}
+    const outgoing = new OutgoingResponse(Fields.fromList([['content-type', new TextEncoder().encode(asset.type)]]));
+    outgoing.setStatusCode(200);
+    const body = outgoing.body();
+    const stream = body.write();
+    stream.blockingWriteAndFlush(asset.bytes);
+    stream[Symbol.dispose]();
+    OutgoingBody.finish(body, undefined);
+    ResponseOutparam.set(responseOutparam, {{ tag: 'ok', val: outgoing }});
+  }},
+}};
+"#
+    ))
 }
 
 fn fetch_bridge(_module: &str, attribute: &str, source_file: &str) -> String {

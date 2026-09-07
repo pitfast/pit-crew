@@ -64,6 +64,14 @@ impl PitCrew {
                 Language::TypeScript,
             )));
         crew.application_adapters
+            .push(Arc::new(adapters::StaticWebAdapter::new(
+                Language::JavaScript,
+            )));
+        crew.application_adapters
+            .push(Arc::new(adapters::StaticWebAdapter::new(
+                Language::TypeScript,
+            )));
+        crew.application_adapters
             .push(Arc::new(adapters::GoNetHttpAdapter::new()));
         crew
     }
