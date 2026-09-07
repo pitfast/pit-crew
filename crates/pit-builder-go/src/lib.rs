@@ -100,6 +100,39 @@ impl GoBuilder {
         }
         Ok(())
     }
+
+    fn staging_workspace(request: &BuildRequest) -> Result<Option<PathBuf>> {
+        let Some(_adapter) = &request.adapter_workspace else {
+            return Ok(None);
+        };
+        let stage = request
+            .project_dir
+            .join(".pit/tmp/go-net-http")
+            .join(std::process::id().to_string());
+        std::fs::create_dir_all(&stage)?;
+        copy_go_project(&request.project_dir, &stage)?;
+        Ok(Some(stage))
+    }
+
+    fn copy_generated_adapter(request: &BuildRequest, stage: &Path) -> Result<()> {
+        let Some(adapter) = &request.adapter_workspace else {
+            return Ok(());
+        };
+        for generated in &adapter.generated_files {
+            let relative = generated.strip_prefix(&adapter.root).with_context(|| {
+                format!(
+                    "generated Go adapter file is outside {}",
+                    adapter.root.display()
+                )
+            })?;
+            let destination = stage.join(relative);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(generated, destination)?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -171,10 +204,29 @@ impl LanguageBuilder for GoBuilder {
             .replace('-', "_");
         let staging = staging_dir.join(format!("{name}.{}.wasm", std::process::id()));
         let artifact_path = build_dir.join(format!("{name}.wasm"));
+        let working_dir =
+            Self::staging_workspace(request)?.unwrap_or_else(|| request.project_dir.clone());
+        if request.adapter_workspace.is_some() {
+            let go = Self::go_tool().unwrap_or_else(|| "go".into());
+            let module = Command::new(&go)
+                .args(["mod", "tidy"])
+                .current_dir(&working_dir)
+                .output()
+                .await
+                .with_context(|| {
+                    format!("failed to resolve Go module in {}", working_dir.display())
+                })?;
+            if !module.status.success() {
+                bail!(
+                    "Go module resolution failed: {}",
+                    text(&module.stdout, &module.stderr)
+                );
+            }
+        }
         let mut bindings = Command::new(Self::tool());
         bindings
             .args(["--world", world.as_str(), "bindings", "--format"])
-            .current_dir(&request.project_dir)
+            .current_dir(&working_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let bindings_output = bindings
@@ -187,11 +239,29 @@ impl LanguageBuilder for GoBuilder {
                 text(&bindings_output.stdout, &bindings_output.stderr)
             );
         }
+        if request.adapter_workspace.is_some() {
+            Self::copy_generated_adapter(request, &working_dir)?;
+            let go = Self::go_tool().unwrap_or_else(|| "go".into());
+            let module = Command::new(&go)
+                .args(["mod", "tidy"])
+                .current_dir(&working_dir)
+                .output()
+                .await
+                .with_context(|| {
+                    format!("failed to resolve Go module in {}", working_dir.display())
+                })?;
+            if !module.status.success() {
+                bail!(
+                    "Go module resolution failed: {}",
+                    text(&module.stdout, &module.stderr)
+                );
+            }
+        }
         let mut command = Command::new(Self::tool());
         command
             .args(["--world", world.as_str(), "build", "--output"])
             .arg(&staging)
-            .current_dir(&request.project_dir)
+            .current_dir(&working_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(go) = Self::go_tool() {
@@ -251,6 +321,29 @@ impl LanguageBuilder for GoBuilder {
             toolchain,
         })
     }
+}
+
+fn copy_go_project(source: &Path, destination: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == ".git" || name == ".pit" || name == "target" || name == "vendor" {
+            continue;
+        }
+        if path.is_dir() {
+            std::fs::create_dir_all(destination.join(&*name))?;
+            copy_go_project(&path, &destination.join(&*name))?;
+        } else if path.is_file()
+            && name != "wit_exports.go"
+            && !name.starts_with("wasi_")
+            && !name.starts_with("export_wasi_")
+        {
+            std::fs::copy(&path, destination.join(&*name))?;
+        }
+    }
+    Ok(())
 }
 
 fn text(stdout: &[u8], stderr: &[u8]) -> String {

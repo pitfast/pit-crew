@@ -251,14 +251,68 @@ pub struct AdapterOutput {
 pub struct CompatibilityReport {
     pub status: CompatibilityStatus,
     pub messages: Vec<String>,
+    #[serde(default)]
+    pub findings: Vec<CompatibilityFinding>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompatibilityStatus {
     Supported,
+    SupportedWithConfiguration,
+    PotentiallyUnsupported,
+    /// Kept for v0.11 serialized/API compatibility. New code should use
+    /// `PotentiallyUnsupported` for a non-confirmed concern.
     PotentialIssue,
     Unsupported,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompatibilitySeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompatibilityCertainty {
+    Confirmed,
+    Potential,
+    Unknown,
+}
+
+/// A structured, interface-neutral compatibility finding. `category` is a
+/// validated-by-convention identifier rather than an enum so new toolchains
+/// can report new classes without changing PitFast's runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompatibilityFinding {
+    pub category: String,
+    pub severity: CompatibilitySeverity,
+    pub certainty: CompatibilityCertainty,
+    #[serde(default)]
+    pub package: Option<String>,
+    #[serde(default)]
+    pub dependency_path: Vec<String>,
+    #[serde(default)]
+    pub evidence: Vec<DetectionEvidence>,
+    pub reason: String,
+    pub recommendation: String,
+    pub blocks_build: bool,
+}
+
+impl CompatibilityReport {
+    pub fn supported(message: impl Into<String>) -> Self {
+        Self {
+            status: CompatibilityStatus::Supported,
+            messages: vec![message.into()],
+            findings: Vec::new(),
+        }
+    }
+
+    pub fn blocks_build(&self) -> bool {
+        self.findings.iter().any(|finding| finding.blocks_build)
+            || matches!(self.status, CompatibilityStatus::Unsupported)
+    }
 }
 
 /// Build-time adapter contract. Implementations may generate files under
@@ -270,6 +324,16 @@ pub trait ApplicationAdapter: Send + Sync {
     fn runtime_world(&self) -> ComponentWorld;
     fn detect(&self, project: &ProjectInspection) -> Option<DetectionCandidate>;
     fn validate(&self, model: &ProjectModel) -> Result<CompatibilityReport>;
+    /// Performs project/dependency inspection in addition to validating the
+    /// selected interface. The default keeps existing adapters source
+    /// compatible and makes compatibility inspection opt-in per toolchain.
+    fn inspect_compatibility(
+        &self,
+        _project: &ProjectInspection,
+        model: &ProjectModel,
+    ) -> Result<CompatibilityReport> {
+        self.validate(model)
+    }
     fn prepare(&self, project: &ProjectInspection, model: &ProjectModel) -> Result<AdapterOutput>;
 }
 
@@ -390,7 +454,11 @@ pub trait LanguageBuilder: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdapterId, ApplicationInterface, Language};
+    use super::{
+        AdapterId, ApplicationInterface, BuildRequest, CompatibilityCertainty,
+        CompatibilityFinding, CompatibilityReport, CompatibilitySeverity, CompatibilityStatus,
+        DetectionEvidence, Language,
+    };
     use std::str::FromStr;
 
     #[test]
@@ -415,5 +483,43 @@ mod tests {
         assert!(ApplicationInterface::new("ASGI").is_err());
         assert!(ApplicationInterface::new("../asgi").is_err());
         assert!(AdapterId::new("local/").is_err());
+    }
+
+    #[test]
+    fn compatibility_findings_preserve_dependency_evidence() {
+        let report = CompatibilityReport {
+            status: CompatibilityStatus::Unsupported,
+            messages: vec!["blocked".into()],
+            findings: vec![CompatibilityFinding {
+                category: "native-extension".into(),
+                severity: CompatibilitySeverity::Error,
+                certainty: CompatibilityCertainty::Confirmed,
+                package: Some("pydantic_core".into()),
+                dependency_path: vec!["fastapi".into(), "pydantic".into(), "pydantic_core".into()],
+                evidence: vec![DetectionEvidence {
+                    source: "WHEEL".into(),
+                    detail: "cp313-manylinux".into(),
+                }],
+                reason: "native extension is not WASI-loadable".into(),
+                recommendation: "use a WASI-compatible build".into(),
+                blocks_build: true,
+            }],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let round_trip: CompatibilityReport = serde_json::from_str(&json).unwrap();
+        assert!(round_trip.blocks_build());
+        assert_eq!(round_trip.findings[0].dependency_path[0], "fastapi");
+    }
+
+    #[test]
+    fn adaptation_inputs_are_cache_semantics() {
+        let mut request = BuildRequest::new("/tmp/project");
+        request.application_interface = Some(ApplicationInterface::new("asgi").unwrap());
+        request.entrypoint = Some("main:app".into());
+        request.adapter = Some("python/asgi".into());
+        let material = request.adaptation_fingerprint_material();
+        assert!(material.contains("interface=asgi"));
+        assert!(material.contains("adapter=python/asgi"));
+        assert!(material.contains("entry=main:app"));
     }
 }

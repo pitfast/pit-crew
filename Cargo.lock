@@ -189,6 +189,7 @@ dependencies = [
  "async-trait",
  "pit-artifact",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -142,13 +142,24 @@ impl LanguageBuilder for JsBuilder {
         self.language
     }
     fn detect(&self, project_dir: &Path) -> Detection {
-        let marker = project_dir.join("package.json").is_file()
-            && match self.language {
-                Language::TypeScript => project_dir.join("main.ts").is_file(),
-                _ => {
-                    project_dir.join("main.js").is_file() && !project_dir.join("main.ts").is_file()
-                }
-            };
+        let has_source = std::fs::read_dir(project_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                let path = entry.path();
+                path.is_file()
+                    && match self.language {
+                        Language::TypeScript => path.extension().is_some_and(|ext| ext == "ts"),
+                        _ => {
+                            path.extension().is_some_and(|ext| ext == "js")
+                                && path.file_name().and_then(|name| name.to_str())
+                                    != Some("main.ts")
+                        }
+                    }
+            });
+        let marker = project_dir.join("package.json").is_file() && has_source;
         if marker {
             Detection::Yes
         } else {
@@ -199,14 +210,22 @@ impl LanguageBuilder for JsBuilder {
             bail!("{} builder supports wasi:http/proxy only", self.language);
         }
         let wit = Self::wit(request)?;
-        let source = self.source(&request.project_dir)?;
+        let source = if let Some(adapter) = &request.adapter_workspace {
+            if self.language == Language::JavaScript {
+                adapter.root.join(&adapter.entrypoint)
+            } else {
+                self.source(&request.project_dir)?
+            }
+        } else {
+            self.source(&request.project_dir)?
+        };
         let toolchain = self.toolchain_for(request).await?;
         let pit_dir = request.project_dir.join(".pit");
         let generated = pit_dir.join("generated");
         let build_dir = pit_dir.join("build");
         tokio::fs::create_dir_all(&generated).await?;
         tokio::fs::create_dir_all(&build_dir).await?;
-        let js_source = if self.language == Language::TypeScript {
+        let compiled_source = if self.language == Language::TypeScript {
             let mut tsc = Command::new(Self::tsc());
             tsc.args([
                 source.to_str().unwrap_or("main.ts"),
@@ -240,6 +259,11 @@ impl LanguageBuilder for JsBuilder {
         } else {
             source.clone()
         };
+        let js_source = request
+            .adapter_workspace
+            .as_ref()
+            .map(|workspace| workspace.root.join(&workspace.entrypoint))
+            .unwrap_or(compiled_source);
         let name = request
             .project_dir
             .file_name()

@@ -18,8 +18,9 @@ pub use pit_artifact::{
 
 pub use pit_builder_core::{
     AdapterId, AdapterOutput, AdapterWorkspace, ApplicationInterface, BuildRequest,
-    CompatibilityReport, CompatibilityStatus, DetectionCandidate, DetectionEvidence, Language,
-    LanguageBuilder, ProjectInspection, ProjectModel, ToolchainInfo,
+    CompatibilityCertainty, CompatibilityFinding, CompatibilityReport, CompatibilitySeverity,
+    CompatibilityStatus, DetectionCandidate, DetectionEvidence, Language, LanguageBuilder,
+    ProjectInspection, ProjectModel, ToolchainInfo,
 };
 pub type BuildArtifact = BuildOutput;
 
@@ -54,6 +55,16 @@ impl PitCrew {
         let mut crew = Self::new(adapters);
         crew.application_adapters
             .push(Arc::new(adapters::PythonAsgiAdapter::new()));
+        crew.application_adapters
+            .push(Arc::new(adapters::JavaScriptFetchAdapter::new(
+                Language::JavaScript,
+            )));
+        crew.application_adapters
+            .push(Arc::new(adapters::JavaScriptFetchAdapter::new(
+                Language::TypeScript,
+            )));
+        crew.application_adapters
+            .push(Arc::new(adapters::GoNetHttpAdapter::new()));
         crew
     }
 
@@ -91,6 +102,59 @@ impl PitCrew {
         languages.sort_by_key(|language| language.as_str());
         languages.dedup();
         Ok(languages)
+    }
+
+    /// Run the selected adapter's project/dependency compatibility inspection
+    /// without compiling. This is the shared implementation used by `pit
+    /// doctor` and by the build path for confirmed blockers.
+    pub fn compatibility(
+        &self,
+        project_dir: &std::path::Path,
+        request: &BuildRequest,
+    ) -> Result<Option<CompatibilityReport>> {
+        let project = ProjectInspection::discover(project_dir)?;
+        let candidates = self
+            .application_adapters
+            .iter()
+            .filter_map(|adapter| adapter.detect(&project))
+            .filter(|candidate| {
+                request
+                    .language
+                    .is_none_or(|language| candidate.language == language)
+            })
+            .collect::<Vec<_>>();
+        let candidate = choose_candidate(request, &candidates)?;
+        let adapter = self.select_application_adapter(request, candidate.as_ref(), &project)?;
+        let Some(adapter) = adapter else {
+            return Ok(None);
+        };
+        let model = candidate
+            .map(|candidate| ProjectModel {
+                language: candidate.language,
+                application_interface: request
+                    .application_interface
+                    .clone()
+                    .or(candidate.application_interface),
+                entrypoint: request.entrypoint.clone().or(candidate.entrypoint),
+                framework_hint: candidate.framework_hint,
+                confidence: candidate.confidence,
+                evidence: candidate.evidence,
+            })
+            .unwrap_or_else(|| ProjectModel {
+                language: request.language.unwrap_or_else(|| adapter.language()),
+                application_interface: request
+                    .application_interface
+                    .clone()
+                    .or_else(|| Some(adapter.interface().clone())),
+                entrypoint: request.entrypoint.clone(),
+                framework_hint: None,
+                confidence: 100,
+                evidence: vec![pit_builder_core::DetectionEvidence {
+                    source: "explicit configuration".into(),
+                    detail: format!("adapter {}", adapter.id()),
+                }],
+            });
+        Ok(Some(adapter.inspect_compatibility(&project, &model)?))
     }
 
     pub async fn build(&self, request: BuildRequest) -> Result<BuildArtifact> {
@@ -215,7 +279,10 @@ impl PitCrew {
                 confidence: candidate.confidence,
                 evidence: candidate.evidence.clone(),
             };
-            adapter.validate(&model)?;
+            let compatibility = adapter.inspect_compatibility(&project_inspection, &model)?;
+            if compatibility.blocks_build() {
+                bail!(format_compatibility_error(&compatibility));
+            }
             let output = adapter.prepare(&project_inspection, &model)?;
             request.adapter_workspace = Some(output.workspace);
         } else if request.application_interface.is_none() {
@@ -321,6 +388,35 @@ impl PitCrew {
             _ => bail!("multiple adapters match the detected application interface"),
         }
     }
+}
+
+fn format_compatibility_error(report: &CompatibilityReport) -> String {
+    let mut message = report
+        .messages
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "application compatibility check failed".into());
+    for finding in &report.findings {
+        if !finding.blocks_build {
+            continue;
+        }
+        message.push_str(&format!(
+            "\n\n[{}] {}{}\nReason: {}\nRecommendation: {}",
+            finding.category,
+            finding.package.as_deref().unwrap_or("project"),
+            if finding.dependency_path.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\nDependency path: {}",
+                    finding.dependency_path.join(" -> ")
+                )
+            },
+            finding.reason,
+            finding.recommendation
+        ));
+    }
+    message
 }
 
 fn choose_candidate(

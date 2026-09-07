@@ -9,13 +9,16 @@ use anyhow::{Context, Result, bail};
 use pit_artifact::ComponentWorld;
 use pit_builder_core::{
     AdapterId, AdapterOutput, AdapterWorkspace, ApplicationAdapter, ApplicationInterface,
-    CompatibilityReport, CompatibilityStatus, DetectionCandidate, DetectionEvidence, Language,
-    ProjectInspection, ProjectModel,
+    CompatibilityCertainty, CompatibilityFinding, CompatibilityReport, CompatibilitySeverity,
+    CompatibilityStatus, DetectionCandidate, DetectionEvidence, Language, ProjectInspection,
+    ProjectModel,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const ASGI_ADAPTER_VERSION: &str = "python/asgi-v1";
+const FETCH_ADAPTER_VERSION: &str = "javascript-fetch-v1";
+const GO_NET_HTTP_ADAPTER_VERSION: &str = "go/net-http-v1";
 
 #[derive(Debug, Clone)]
 pub struct PythonAsgiAdapter {
@@ -35,6 +38,267 @@ impl PythonAsgiAdapter {
 impl Default for PythonAsgiAdapter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct JavaScriptFetchAdapter {
+    language: Language,
+    id: AdapterId,
+    interface: ApplicationInterface,
+}
+
+impl JavaScriptFetchAdapter {
+    pub fn new(language: Language) -> Self {
+        assert!(matches!(
+            language,
+            Language::JavaScript | Language::TypeScript
+        ));
+        Self {
+            language,
+            id: AdapterId::new("javascript/fetch").expect("built-in adapter id is valid"),
+            interface: ApplicationInterface::new("fetch").expect("built-in interface id is valid"),
+        }
+    }
+}
+
+impl ApplicationAdapter for JavaScriptFetchAdapter {
+    fn id(&self) -> AdapterId {
+        self.id.clone()
+    }
+
+    fn language(&self) -> Language {
+        self.language
+    }
+
+    fn interface(&self) -> &ApplicationInterface {
+        &self.interface
+    }
+
+    fn runtime_world(&self) -> ComponentWorld {
+        ComponentWorld::WasiHttpProxy
+    }
+
+    fn detect(&self, project: &ProjectInspection) -> Option<DetectionCandidate> {
+        let source_name = if self.language == Language::TypeScript {
+            "main.ts"
+        } else {
+            "main.js"
+        };
+        if !project.has_file("package.json") || !project.has_file(source_name) {
+            return None;
+        }
+        let source = std::fs::read_to_string(project.root.join(source_name)).ok()?;
+        if !source.contains("fetch") && !source.contains("addEventListener") {
+            return None;
+        }
+        Some(DetectionCandidate {
+            language: self.language,
+            application_interface: Some(self.interface.clone()),
+            entrypoint: Some("main:fetch".into()),
+            framework_hint: None,
+            confidence: 70,
+            evidence: vec![DetectionEvidence {
+                source: source_name.into(),
+                detail: "Fetch-style handler shape".into(),
+            }],
+        })
+    }
+
+    fn validate(&self, model: &ProjectModel) -> Result<CompatibilityReport> {
+        if model.language != self.language {
+            bail!("adapter '{}' requires {}", self.id, self.language);
+        }
+        if model.application_interface.as_ref() != Some(&self.interface) {
+            bail!("adapter '{}' requires the Fetch interface", self.id);
+        }
+        if model.entrypoint.as_deref().unwrap_or_default().is_empty() {
+            bail!("Fetch adapter requires an entrypoint such as main:fetch");
+        }
+        Ok(CompatibilityReport::supported(
+            "Fetch handlers are bridged through ComponentizeJS Web Fetch semantics to wasi:http/proxy",
+        ))
+    }
+
+    fn prepare(&self, project: &ProjectInspection, model: &ProjectModel) -> Result<AdapterOutput> {
+        self.validate(model)?;
+        let (module, attribute) = split_entrypoint(
+            model
+                .entrypoint
+                .as_deref()
+                .context("Fetch entrypoint is missing")?,
+        )?;
+        let root = project
+            .root
+            .join(".pit/generated/adapters/javascript-fetch");
+        std::fs::create_dir_all(&root)?;
+        let source_file = if self.language == Language::TypeScript && module == "main" {
+            "../../main.js".to_owned()
+        } else {
+            format!("../../../../{module}.js")
+        };
+        let bridge = fetch_bridge(module, attribute, &source_file);
+        let bridge_path = root.join("main.js");
+        std::fs::write(&bridge_path, bridge.as_bytes())?;
+        let mut digest_files = Vec::new();
+        collect_files(&root, &root, &mut digest_files)?;
+        let digest = adapter_digest_bytes(
+            FETCH_ADAPTER_VERSION,
+            &self.id,
+            &self.interface,
+            &format!("{module}:{attribute}"),
+            &digest_files,
+        );
+        Ok(AdapterOutput {
+            workspace: AdapterWorkspace {
+                root: root.clone(),
+                source_roots: vec![root.clone(), project.root.clone()],
+                wit_path: None,
+                entrypoint: "main.js".into(),
+                adapter: self.id.clone(),
+                digest,
+                generated_files: digest_files
+                    .into_iter()
+                    .map(|(path, _)| root.join(path))
+                    .collect(),
+            },
+            runtime_world: self.runtime_world(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GoNetHttpAdapter {
+    id: AdapterId,
+    interface: ApplicationInterface,
+}
+
+impl GoNetHttpAdapter {
+    pub fn new() -> Self {
+        Self {
+            id: AdapterId::new("go/net-http").expect("built-in adapter id is valid"),
+            interface: ApplicationInterface::new("net-http")
+                .expect("built-in interface id is valid"),
+        }
+    }
+}
+
+impl Default for GoNetHttpAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ApplicationAdapter for GoNetHttpAdapter {
+    fn id(&self) -> AdapterId {
+        self.id.clone()
+    }
+
+    fn language(&self) -> Language {
+        Language::Go
+    }
+
+    fn interface(&self) -> &ApplicationInterface {
+        &self.interface
+    }
+
+    fn runtime_world(&self) -> ComponentWorld {
+        ComponentWorld::WasiHttpProxy
+    }
+
+    fn detect(&self, project: &ProjectInspection) -> Option<DetectionCandidate> {
+        if !project.has_file("go.mod") {
+            return None;
+        }
+        let has_http_shape = project
+            .files
+            .iter()
+            .filter(|path| path.extension().is_some_and(|extension| extension == "go"))
+            .any(|path| {
+                std::fs::read_to_string(project.root.join(path))
+                    .map(|source| source.contains("http.Handler") || source.contains("ServeHTTP"))
+                    .unwrap_or(false)
+            });
+        has_http_shape.then(|| DetectionCandidate {
+            language: Language::Go,
+            application_interface: Some(self.interface.clone()),
+            entrypoint: Some("app:Handler".into()),
+            framework_hint: None,
+            confidence: 65,
+            evidence: vec![DetectionEvidence {
+                source: "Go source inspection".into(),
+                detail: "net/http Handler shape".into(),
+            }],
+        })
+    }
+
+    fn validate(&self, model: &ProjectModel) -> Result<CompatibilityReport> {
+        if model.language != Language::Go {
+            bail!("adapter '{}' requires Go", self.id);
+        }
+        if model.application_interface.as_ref() != Some(&self.interface) {
+            bail!("adapter '{}' requires the net/http interface", self.id);
+        }
+        let entrypoint = model.entrypoint.as_deref().unwrap_or_default();
+        if !entrypoint.contains(':') {
+            bail!("Go net/http adapter requires an entrypoint such as app:Handler");
+        }
+        let (package, _) = split_entrypoint(entrypoint)?;
+        if package == "main" || package == "." {
+            bail!(
+                "Go net/http adapter requires the Handler in an importable package (for example app:Handler); a root package main would create an import cycle"
+            );
+        }
+        Ok(CompatibilityReport::supported(
+            "Go http.Handler is bridged to wasi:http/proxy without a service listener",
+        ))
+    }
+
+    fn prepare(&self, project: &ProjectInspection, model: &ProjectModel) -> Result<AdapterOutput> {
+        self.validate(model)?;
+        let (package, symbol) = split_entrypoint(
+            model
+                .entrypoint
+                .as_deref()
+                .context("Go net/http entrypoint is missing")?,
+        )?;
+        if !project.root.join("go.mod").is_file() {
+            bail!("go.mod must exist for the net/http adapter");
+        }
+        // componentize-go generates bindings in a staging module named
+        // `wit_component`; the bridge follows that generated module identity
+        // instead of importing the user's original module from the network.
+        let import_path = format!("wit_component/{package}");
+        let root = project.root.join(".pit/generated/adapters/go-net-http");
+        let package_dir = root.join("export_wasi_http_incoming_handler");
+        std::fs::create_dir_all(&package_dir)?;
+        let bridge = go_net_http_bridge("wit_component", &import_path, symbol);
+        let bridge_path = package_dir.join("handler.go");
+        std::fs::write(&bridge_path, bridge.as_bytes())?;
+        let mut digest_files = Vec::new();
+        collect_files(&root, &root, &mut digest_files)?;
+        let digest = adapter_digest_bytes(
+            GO_NET_HTTP_ADAPTER_VERSION,
+            &self.id,
+            &self.interface,
+            model.entrypoint.as_deref().unwrap_or_default(),
+            &digest_files,
+        );
+        Ok(AdapterOutput {
+            workspace: AdapterWorkspace {
+                root: root.clone(),
+                source_roots: vec![root.clone(), project.root.clone()],
+                wit_path: None,
+                entrypoint: "main".into(),
+                adapter: self.id.clone(),
+                digest,
+                generated_files: digest_files
+                    .into_iter()
+                    .map(|(path, _)| root.join(path))
+                    .collect(),
+            },
+            runtime_world: self.runtime_world(),
+        })
     }
 }
 
@@ -134,7 +398,21 @@ impl ApplicationAdapter for PythonAsgiAdapter {
         Ok(CompatibilityReport {
             status: CompatibilityStatus::Supported,
             messages: vec!["ASGI is bridged to wasi:http/proxy".into()],
+            findings: Vec::new(),
         })
+    }
+
+    fn inspect_compatibility(
+        &self,
+        project: &ProjectInspection,
+        model: &ProjectModel,
+    ) -> Result<CompatibilityReport> {
+        let mut report = self.validate(model)?;
+        let dependency_report = inspect_python_dependencies(project);
+        report.status = dependency_report.status;
+        report.messages.extend(dependency_report.messages);
+        report.findings.extend(dependency_report.findings);
+        Ok(report)
     }
 
     fn prepare(&self, project: &ProjectInspection, model: &ProjectModel) -> Result<AdapterOutput> {
@@ -287,6 +565,7 @@ impl ApplicationAdapter for ExternalAdapter {
                 "external adapter version {}",
                 self.manifest.adapter.version
             )],
+            findings: Vec::new(),
         })
     }
     fn prepare(&self, project: &ProjectInspection, model: &ProjectModel) -> Result<AdapterOutput> {
@@ -358,11 +637,595 @@ fn split_entrypoint(entrypoint: &str) -> Result<(&str, &str)> {
     let (module, attribute) = entrypoint
         .split_once(':')
         .ok_or_else(|| anyhow::anyhow!("entrypoint must use module:attribute syntax"))?;
-    if module.is_empty() || attribute.is_empty() || module.contains('/') || attribute.contains('/')
+    if module.is_empty()
+        || attribute.is_empty()
+        || module.starts_with('.')
+        || module.contains('\\')
+        || module
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || attribute.contains('/')
     {
         bail!("entrypoint contains an invalid module or attribute");
     }
     Ok((module, attribute))
+}
+
+fn fetch_bridge(_module: &str, attribute: &str, source_file: &str) -> String {
+    format!(
+        r#"import {{ {attribute} as handler }} from "{source_file}";
+import {{ IncomingBody, OutgoingBody, OutgoingResponse, Fields, ResponseOutparam }} from 'wasi:http/types@0.2.0';
+
+const encoder = new TextEncoder();
+
+function methodName(method) {{
+  return method.tag === 'other' ? method.val : method.tag.toUpperCase();
+}}
+
+function readBody(request) {{
+  const body = request.consume();
+  const input = body.stream();
+  const pollable = input.subscribe();
+  const chunks = [];
+  while (true) {{
+    if (!pollable.ready()) pollable.block();
+    try {{
+      const chunk = input.read(65536n);
+      if (chunk.length === 0) break;
+      chunks.push(chunk);
+    }} catch (error) {{
+      if (error?.payload?.tag === 'closed') break;
+      throw error;
+    }}
+  }}
+  pollable[Symbol.dispose]?.();
+  input[Symbol.dispose]?.();
+  IncomingBody.finish(body);
+  const total = chunks.reduce((size, chunk) => size + chunk.length, 0);
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {{ result.set(chunk, offset); offset += chunk.length; }}
+  return result;
+}}
+
+export const incomingHandler = {{
+  async handle(request, responseOutparam) {{
+    const path = request.pathWithQuery() ?? '/';
+    const headers = new Headers();
+    const requestHeaders = request.headers();
+    for (const [name, values] of requestHeaders.entries()) {{
+      headers.append(name, new TextDecoder().decode(values));
+    }}
+    requestHeaders[Symbol.dispose]?.();
+    const init = {{ method: methodName(request.method()), headers }};
+    if (init.method !== 'GET' && init.method !== 'HEAD') init.body = readBody(request);
+    const authority = request.authority() ?? 'pitfast.local';
+    const response = await handler(new Request(`http://${{authority}}${{path}}`, init));
+    const responseFields = [];
+    for (const [name, value] of response.headers) {{
+      responseFields.push([name.toString(), encoder.encode(value)]);
+    }}
+    const outgoing = new OutgoingResponse(Fields.fromList(responseFields));
+    outgoing.setStatusCode(response.status);
+    const body = outgoing.body();
+    const stream = body.write();
+    stream.blockingWriteAndFlush(new Uint8Array(await response.arrayBuffer()));
+    stream[Symbol.dispose]();
+    OutgoingBody.finish(body, undefined);
+    ResponseOutparam.set(responseOutparam, {{ tag: 'ok', val: outgoing }});
+  }},
+}};
+"#
+    )
+}
+
+fn go_net_http_bridge(module: &str, import_path: &str, symbol: &str) -> String {
+    format!(
+        r#"package export_wasi_http_incoming_handler
+
+import (
+    "bytes"
+    "net/http"
+    "net/http/httptest"
+    "strings"
+
+    wit_types "go.bytecodealliance.org/pkg/wit/types"
+    user "{import_path}"
+    . "{module}/wasi_http_types"
+)
+
+var pitfastHandler http.Handler = user.{symbol}
+
+func Handle(request *IncomingRequest, out *ResponseOutparam) {{
+    path := request.PathWithQuery().SomeOr("/")
+    method := methodName(request.Method())
+    body := readBody(request)
+    incoming, err := http.NewRequest(method, "http://pitfast.local"+path, bytes.NewReader(body))
+    if err != nil {{
+        writeError(out, http.StatusBadRequest, err.Error())
+        return
+    }}
+    headers := request.Headers()
+    for _, header := range headers.Entries() {{
+        incoming.Header.Add(header.F0, string(header.F1))
+    }}
+    headers.Drop()
+    recorder := httptest.NewRecorder()
+    pitfastHandler.ServeHTTP(recorder, incoming)
+
+    response := MakeOutgoingResponse(MakeFields())
+    response.SetStatusCode(uint16(recorder.Code))
+    responseHeaders := response.Headers()
+    for name, values := range recorder.Header() {{
+        for _, value := range values {{
+            responseHeaders.Append(name, []byte(value))
+        }}
+    }}
+    responseHeaders.Drop()
+    bodyResult := response.Body()
+    ResponseOutparamSet(out, wit_types.Ok[*OutgoingResponse, ErrorCode](response))
+    if bodyResult.IsErr() {{
+        return
+    }}
+    outputResult := bodyResult.Ok().Write()
+    if outputResult.IsErr() {{
+        OutgoingBodyFinish(bodyResult.Ok(), wit_types.None[*Fields]())
+        return
+    }}
+    output := outputResult.Ok()
+    output.BlockingWriteAndFlush(recorder.Body.Bytes())
+    output.Drop()
+    OutgoingBodyFinish(bodyResult.Ok(), wit_types.None[*Fields]())
+}}
+
+func methodName(method Method) string {{
+    switch method.Tag() {{
+    case MethodGet: return "GET"
+    case MethodHead: return "HEAD"
+    case MethodPost: return "POST"
+    case MethodPut: return "PUT"
+    case MethodDelete: return "DELETE"
+    case MethodConnect: return "CONNECT"
+    case MethodOptions: return "OPTIONS"
+    case MethodTrace: return "TRACE"
+    case MethodPatch: return "PATCH"
+    case MethodOther: return method.Other()
+    default: return "GET"
+    }}
+}}
+
+func readBody(request *IncomingRequest) []byte {{
+    body := request.Consume()
+    if body.IsErr() {{ return nil }}
+    stream := body.Ok().Stream()
+    if stream.IsErr() {{ return nil }}
+    var result []byte
+    for {{
+        chunk := stream.Ok().BlockingRead(65536)
+        if chunk.IsErr() || len(chunk.Ok()) == 0 {{ break }}
+        result = append(result, chunk.Ok()...)
+    }}
+    stream.Ok().Drop()
+    trailers := IncomingBodyFinish(body.Ok())
+    pollable := trailers.Subscribe()
+    pollable.Block()
+    pollable.Drop()
+    trailers.Get()
+    return result
+}}
+
+func writeError(out *ResponseOutparam, status int, message string) {{
+    response := MakeOutgoingResponse(MakeFields())
+    response.SetStatusCode(uint16(status))
+    body := response.Body()
+    ResponseOutparamSet(out, wit_types.Ok[*OutgoingResponse, ErrorCode](response))
+    if body.IsErr() {{ return }}
+    stream := body.Ok().Write()
+    if stream.IsOk() {{
+        stream.Ok().BlockingWriteAndFlush([]byte(strings.TrimSpace(message)))
+        stream.Ok().Drop()
+    }}
+    OutgoingBodyFinish(body.Ok(), wit_types.None[*Fields]())
+}}
+
+"#
+    )
+}
+
+#[derive(Debug, Clone)]
+struct PythonDistribution {
+    name: String,
+    root: PathBuf,
+    metadata_dir: PathBuf,
+    requires: Vec<String>,
+    wheel_tags: Vec<String>,
+}
+
+/// Inspect the package metadata that componentize-py can actually see. This
+/// is intentionally a conservative metadata reader, not a second pip: it
+/// reports confirmed native files and unknown resolution separately instead of
+/// pretending that a source-level heuristic proves compatibility.
+fn inspect_python_dependencies(project: &ProjectInspection) -> CompatibilityReport {
+    let direct = python_direct_dependencies(project);
+    let mut report = CompatibilityReport {
+        status: CompatibilityStatus::Supported,
+        messages: Vec::new(),
+        findings: Vec::new(),
+    };
+    if direct.is_empty() {
+        report
+            .messages
+            .push("no declared Python dependencies to inspect".into());
+    }
+
+    let distributions = python_distributions(project);
+    let mut by_name = std::collections::BTreeMap::new();
+    for distribution in distributions {
+        by_name.insert(
+            normalize_distribution_name(&distribution.name),
+            distribution,
+        );
+    }
+
+    let mut queue = direct
+        .into_iter()
+        .map(|name| (normalize_distribution_name(&name), vec![name]))
+        .collect::<std::collections::VecDeque<_>>();
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some((name, path)) = queue.pop_front() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let Some(distribution) = by_name.get(&name) else {
+            report.findings.push(CompatibilityFinding {
+                category: "dependency-resolution".into(),
+                severity: CompatibilitySeverity::Warning,
+                certainty: CompatibilityCertainty::Unknown,
+                package: Some(name.clone()),
+                dependency_path: path.clone(),
+                evidence: vec![DetectionEvidence {
+                    source: "Python project metadata".into(),
+                    detail: "no installed dist-info metadata was visible to PitCrew".into(),
+                }],
+                reason: format!("dependency '{name}' could not be inspected locally"),
+                recommendation:
+                    "run the build in the same environment used by componentize-py or provide a lock/materialization".into(),
+                blocks_build: false,
+            });
+            continue;
+        };
+
+        if let Some(native) = native_extension_evidence(distribution) {
+            let mut evidence = vec![DetectionEvidence {
+                source: native,
+                detail: format!(
+                    "{} contains a native extension; wheel tags: {}",
+                    distribution.name,
+                    if distribution.wheel_tags.is_empty() {
+                        "unknown".into()
+                    } else {
+                        distribution.wheel_tags.join(", ")
+                    }
+                ),
+            }];
+            if distribution.name.eq_ignore_ascii_case("pydantic_core") {
+                evidence.push(DetectionEvidence {
+                    source: "pydantic_core package metadata".into(),
+                    detail: "maturin wheel targets CPython/Linux rather than the embedded WASI Python runtime".into(),
+                });
+            }
+            report.findings.push(CompatibilityFinding {
+                category: "native-extension".into(),
+                severity: CompatibilitySeverity::Error,
+                certainty: CompatibilityCertainty::Confirmed,
+                package: Some(distribution.name.clone()),
+                dependency_path: path.clone(),
+                evidence,
+                reason: format!(
+                    "{} loads a CPython/native shared object that the current componentize-py WASI runtime cannot load",
+                    distribution.name
+                ),
+                recommendation: "use a pure-Python dependency or a wheel/source build explicitly targeting the current WASI Python toolchain".into(),
+                blocks_build: true,
+            });
+        }
+
+        for dependency in &distribution.requires {
+            let mut dependency_path = path.clone();
+            dependency_path.push(dependency.clone());
+            queue.push_back((normalize_distribution_name(dependency), dependency_path));
+        }
+    }
+
+    for (category, token, recommendation) in [
+        (
+            "subprocess",
+            "subprocess",
+            "replace host process execution with a guest-native API; host exec is unavailable",
+        ),
+        (
+            "raw-socket",
+            "socket",
+            "use WASI HTTP or an explicitly configured resource capability",
+        ),
+        (
+            "dynamic-loading",
+            "ctypes",
+            "verify that the dependency does not require host shared libraries",
+        ),
+        (
+            "dynamic-loading",
+            "cffi",
+            "verify that the dependency does not require host shared libraries",
+        ),
+    ] {
+        if project_python_source_contains(project, token) {
+            report.findings.push(CompatibilityFinding {
+                category: category.into(),
+                severity: CompatibilitySeverity::Warning,
+                certainty: CompatibilityCertainty::Potential,
+                package: None,
+                dependency_path: Vec::new(),
+                evidence: vec![DetectionEvidence {
+                    source: "Python source inspection".into(),
+                    detail: format!("found '{token}' in project source"),
+                }],
+                reason: format!(
+                    "project may rely on {token} capabilities outside the default guest contract"
+                ),
+                recommendation: recommendation.into(),
+                blocks_build: false,
+            });
+        }
+    }
+
+    if report.findings.iter().any(|finding| finding.blocks_build) {
+        report.status = CompatibilityStatus::Unsupported;
+        report
+            .messages
+            .push("one or more dependencies are confirmed incompatible with the current WASI Python target".into());
+    } else if report
+        .findings
+        .iter()
+        .any(|finding| finding.certainty != CompatibilityCertainty::Confirmed)
+    {
+        report.status = CompatibilityStatus::PotentiallyUnsupported;
+        report
+            .messages
+            .push("dependency compatibility has potential or unresolved findings".into());
+    } else {
+        report
+            .messages
+            .push("declared Python dependencies have no confirmed native incompatibility".into());
+    }
+    report
+}
+
+fn python_direct_dependencies(project: &ProjectInspection) -> Vec<String> {
+    let mut dependencies = Vec::new();
+    if let Ok(contents) = std::fs::read_to_string(project.root.join("requirements.txt")) {
+        for line in contents.lines() {
+            if let Some(name) = parse_dependency_token(line) {
+                dependencies.push(name);
+            }
+        }
+    }
+    if let Ok(contents) = std::fs::read_to_string(project.root.join("pyproject.toml")) {
+        let mut in_dependencies = false;
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains("dependencies") && trimmed.contains('[') {
+                in_dependencies = true;
+            }
+            if in_dependencies {
+                let content = trimmed.strip_prefix("dependencies =").unwrap_or(trimmed);
+                for item in content.split(',') {
+                    if let Some(name) = parse_dependency_token(item) {
+                        dependencies.push(name);
+                    }
+                }
+                if trimmed.contains(']') {
+                    in_dependencies = false;
+                }
+            }
+        }
+    }
+    if let Ok(contents) = std::fs::read_to_string(project.root.join("setup.py")) {
+        for line in contents
+            .lines()
+            .filter(|line| line.contains("install_requires"))
+        {
+            for item in line.split([',', '[', ']']) {
+                if let Some(name) = parse_dependency_token(item) {
+                    dependencies.push(name);
+                }
+            }
+        }
+    }
+    dependencies.sort_by_key(|value| normalize_distribution_name(value));
+    dependencies.dedup_by_key(|value| normalize_distribution_name(value));
+    dependencies
+}
+
+fn python_distributions(project: &ProjectInspection) -> Vec<PythonDistribution> {
+    let mut roots = Vec::new();
+    // Prefer project-local environments so `pit doctor` works from a cloned
+    // repository without requiring the developer to activate its venv.
+    roots.push(project.root.join(".venv").join("lib"));
+    roots.push(project.root.join("venv").join("lib"));
+    if let Ok(virtual_env) = std::env::var("VIRTUAL_ENV") {
+        roots.push(PathBuf::from(virtual_env).join("lib"));
+    }
+    if let Ok(path) = std::env::var("PITFAST_PYTHON_SITE_PACKAGES") {
+        roots.push(PathBuf::from(path));
+    }
+    let mut site_packages = Vec::new();
+    for root in roots {
+        collect_named_dirs(&root, "site-packages", &mut site_packages, 4);
+    }
+    let mut result = Vec::new();
+    for site in site_packages {
+        let Ok(entries) = std::fs::read_dir(site) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_dist_info = path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.ends_with(".dist-info") || name.ends_with(".egg-info")
+                    });
+            if !is_dist_info {
+                continue;
+            }
+            let metadata = path.join("METADATA");
+            let Ok(contents) = std::fs::read_to_string(&metadata) else {
+                continue;
+            };
+            let name = metadata_field(&contents, "Name").unwrap_or_else(|| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown")
+                    .trim_end_matches(".dist-info")
+                    .to_owned()
+            });
+            let requires = contents
+                .lines()
+                .filter_map(|line| line.strip_prefix("Requires-Dist:"))
+                .filter_map(|line| {
+                    if line.contains("extra ==") {
+                        return None;
+                    }
+                    let value = line.trim().split(';').next().unwrap_or("");
+                    let value = value.split(['<', '>', '=', '!', '~', '[']).next()?.trim();
+                    (!value.is_empty()).then_some(value.to_owned())
+                })
+                .collect();
+            let wheel_tags = std::fs::read_to_string(path.join("WHEEL"))
+                .ok()
+                .into_iter()
+                .flat_map(|contents| {
+                    contents
+                        .lines()
+                        .filter_map(|line| {
+                            line.strip_prefix("Tag:").map(|tag| tag.trim().to_owned())
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            result.push(PythonDistribution {
+                name,
+                root: path.parent().unwrap_or(&path).to_path_buf(),
+                metadata_dir: path.clone(),
+                requires,
+                wheel_tags,
+            });
+        }
+    }
+    result
+}
+
+fn collect_named_dirs(root: &Path, name: &str, result: &mut Vec<PathBuf>, depth: usize) {
+    if depth == 0 || !root.is_dir() {
+        return;
+    }
+    if root.file_name().and_then(|value| value.to_str()) == Some(name) {
+        result.push(root.to_path_buf());
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.path().is_dir() {
+            collect_named_dirs(&entry.path(), name, result, depth - 1);
+        }
+    }
+}
+
+fn metadata_field(contents: &str, field: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        line.strip_prefix(field)
+            .and_then(|value| value.strip_prefix(':'))
+            .map(|value| value.trim().to_owned())
+    })
+}
+
+fn parse_dependency_token(value: &str) -> Option<String> {
+    let value = value
+        .split('#')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .trim_matches(['[', ']', ',', ' ', '"', '\'']);
+    let value = value.split(';').next().unwrap_or(value);
+    let value = value
+        .split(['<', '>', '=', '!', '~', '['])
+        .next()
+        .unwrap_or(value)
+        .trim();
+    (!value.is_empty()
+        && value.bytes().any(|byte| byte.is_ascii_alphabetic())
+        && value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphabetic()))
+    .then(|| value.to_owned())
+}
+
+fn normalize_distribution_name(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace(['_', '.'], "-")
+}
+
+fn native_extension_evidence(distribution: &PythonDistribution) -> Option<String> {
+    let mut package_roots = Vec::new();
+    if let Ok(contents) = std::fs::read_to_string(distribution.metadata_dir.join("top_level.txt")) {
+        package_roots.extend(
+            contents
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| distribution.root.join(line.trim())),
+        );
+    }
+    if package_roots.is_empty() {
+        package_roots.push(
+            distribution
+                .root
+                .join(normalize_distribution_name(&distribution.name).replace('-', "_")),
+        );
+    }
+    let mut stack = package_roots;
+    while let Some(path) = stack.pop() {
+        if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                stack.extend(entries.flatten().map(|entry| entry.path()));
+            }
+        } else if path.extension().is_some_and(|extension| {
+            matches!(extension.to_str(), Some("so" | "pyd" | "dll" | "dylib"))
+        }) {
+            return Some(path.display().to_string());
+        }
+    }
+    None
+}
+
+fn project_python_source_contains(project: &ProjectInspection, token: &str) -> bool {
+    project
+        .files
+        .iter()
+        .filter(|path| path.extension().is_some_and(|extension| extension == "py"))
+        .any(|path| {
+            std::fs::read_to_string(project.root.join(path))
+                .map(|contents| {
+                    contents.lines().any(|line| {
+                        line.trim_start().starts_with("import ") && line.contains(token)
+                            || line.trim_start().starts_with("from ") && line.contains(token)
+                    })
+                })
+                .unwrap_or(false)
+        })
 }
 
 fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {

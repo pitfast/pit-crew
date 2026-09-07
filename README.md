@@ -92,7 +92,8 @@ existing WASI contract; detectors only provide explainable convenience hints;
 Kits are bundles of those build-time pieces. None of these concepts enter
 PitBox or the request path. Framework names are metadata, not runtime identity.
 
-The current built-in non-native interface is Python ASGI:
+The current built-in application-interface adapters are Python ASGI,
+JavaScript/TypeScript Fetch, and Go net/http:
 
 ```toml
 [build]
@@ -101,6 +102,14 @@ interface = "asgi"
 entry = "main:app"
 adapter = "python/asgi"
 ```
+
+Fetch projects use `interface = "fetch"` and an entrypoint such as
+`main:fetch`; Go projects use `interface = "net-http"` and an importable
+`http.Handler` such as `app:Handler`. Both adapters generate a bridge below
+`.pit/generated` and produce the same `wasi:http/proxy` Component. A Go
+application must expose the handler from an importable package; a root
+`package main` listener is rejected because it would require a service port or
+an import cycle.
 
 `pit init --dry-run` shows the evidence used for a proposed configuration.
 When detection is not possible, `pit init --language python --interface asgi
@@ -170,6 +179,55 @@ Falcon. A plain mystery ASGI application also passes with no framework hint.
 FastAPI 0.141.1 was attempted; its `pydantic_core` native CPython extension is
 not available inside the embedded componentize-py runtime, so that application
 is reported as a toolchain incompatibility rather than advertised as supported.
+
+### Real-application compatibility
+
+`pit doctor` is the early compatibility boundary. It reports interface,
+adapter, evidence, dependency findings, certainty, and actionable remedies;
+`pit doctor --verbose` adds transitive dependency paths and package evidence,
+while `pit doctor --json` emits schema version 1 for CI. A confirmed native
+extension blocks `pit build`; a static capability hint such as `subprocess` is
+reported as a potential issue instead of a false incompatibility.
+
+For FastAPI 0.141.1 the observed dependency path is:
+
+```text
+fastapi → pydantic → pydantic_core
+         → pydantic_core/_pydantic_core.cpython-313-x86_64-linux-gnu.so
+         → cp313 manylinux wheel
+```
+
+That shared object is a CPython/Linux native extension, not a WASI-targeted
+module that the current componentize-py embedded runtime can load. PitFast
+does not add a FastAPI runtime or host-Python fallback; it diagnoses the
+generic native-extension boundary before componentization.
+
+The current real compatibility corpus includes Starlette, Falcon, an unknown
+ASGI application, a plain Fetch handler, an unknown Fetch application, plain
+Go `net/http`, and Go Chi through the same generic `go/net-http` bridge.
+
+### Python dependency compatibility taxonomy
+
+The Python inspector is deliberately conservative. It reads declared
+dependencies and locally visible `dist-info` metadata, follows
+`Requires-Dist` edges, and reports evidence rather than pretending that a
+source scan is a proof of runtime compatibility:
+
+| Dependency shape | Doctor result in the current toolchain |
+| --- | --- |
+| Pure-Python package | supported when its metadata is available and no other finding blocks the build |
+| Package data | supported by the embedded runtime when the package is included by the componentizer; missing data is reported by the build |
+| `ctypes`/`cffi` or raw sockets | potential issue unless a compatible guest capability is explicitly proven |
+| CPython, PyO3, or other native extension | confirmed blocker when a native shared object is present and no WASI-targeted replacement is available |
+| System shared library, subprocess, thread, or filesystem assumptions | potential or unknown finding until the package/toolchain proves the required capability |
+| Platform-specific wheel | confirmed blocker when its wheel contains a host-native extension; otherwise unknown until the build resolves it |
+
+This taxonomy is generic: `pydantic_core` is one observed example of the
+native-extension category, not a FastAPI-specific rule. Native Python
+extension support was not achieved in this release because the current
+`componentize-py` embedded runtime has no safe loader for CPython/Linux
+shared objects and no validated WASI wheel/source path was available.
+The appropriate outcome is an early diagnostic, not a host-Python fallback.
 
 The resulting artifact remains a generic WASI Preview 1 core module or WASI
 Preview 2 Component (`wasi:cli/command` or `wasi:http/proxy`). Embedded JS and
