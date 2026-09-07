@@ -1265,8 +1265,18 @@ fn collect_files(root: &Path, current: &Path, files: &mut Vec<(PathBuf, Vec<u8>)
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
+            if path
+                .file_name()
+                .is_some_and(|name| name == "__pycache__" || name == ".git" || name == ".pit")
+            {
+                continue;
+            }
             collect_files(root, &path, files)?;
-        } else if path.is_file() {
+        } else if path.is_file()
+            && !path
+                .extension()
+                .is_some_and(|extension| extension == "pyc" || extension == "pyo")
+        {
             files.push((path.strip_prefix(root)?.to_path_buf(), std::fs::read(path)?));
         }
     }
@@ -1367,4 +1377,25 @@ class Handler(IncomingHandler):
         loop.run_until_complete(_handle(request, response_out))
 "#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_files;
+    use std::fs;
+
+    #[test]
+    fn adapter_digest_inputs_ignore_python_bytecode() {
+        let root = std::env::temp_dir().join(format!("pit-adapter-files-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("__pycache__")).unwrap();
+        fs::write(root.join("main.py"), "app = object()\n").unwrap();
+        fs::write(root.join("__pycache__/main.cpython-314.pyc"), [1, 2, 3]).unwrap();
+
+        let mut files = Vec::new();
+        collect_files(&root, &root, &mut files).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0.to_string_lossy(), "main.py");
+        let _ = fs::remove_dir_all(root);
+    }
 }
