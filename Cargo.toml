@@ -26,3 +26,4 @@ serde_json = "1.0"
 sha2 = "0.10"
 tokio = { version = "1.53", features = ["fs", "io-util", "macros", "process", "rt-multi-thread"] }
 wasmparser = "0.240"
+toml = "0.9"

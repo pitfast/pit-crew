@@ -79,6 +79,98 @@ JavaScript/TypeScript, Python, and experimental C#/Java adapters implement that
 contract. `pit-crew` registers them and performs common fingerprint, cache,
 manifest, digest, and integrity handling.
 
+## Universal application adaptation
+
+PitCrew separates four build-time concerns:
+
+```text
+language toolchain → application adapter → project detector → optional Kit
+```
+
+Toolchains compile source; adapters bridge an application interface to an
+existing WASI contract; detectors only provide explainable convenience hints;
+Kits are bundles of those build-time pieces. None of these concepts enter
+PitBox or the request path. Framework names are metadata, not runtime identity.
+
+The current built-in non-native interface is Python ASGI:
+
+```toml
+[build]
+language = "python"
+interface = "asgi"
+entry = "main:app"
+adapter = "python/asgi"
+```
+
+`pit init --dry-run` shows the evidence used for a proposed configuration.
+When detection is not possible, `pit init --language python --interface asgi
+--entry main:app` is sufficient; no framework detector is required. Generated
+bridge files are kept below `.pit/generated` and user source is never rewritten.
+
+Known frameworks and unknown applications that implement ASGI use the same
+adapter and produce the same `wasi:http/proxy` Component contract. A local
+declarative adapter can extend the build system without a PitCrew source
+change:
+
+```toml
+schema = 1
+
+[adapter]
+id = "local/banana-http"
+language = "python"
+interface = "banana-http"
+target = "wasi:http/proxy"
+version = "1.0.0"
+
+[generator]
+kind = "python-template"
+entrypoint = "app"
+files = ["app.py"]
+```
+
+Select it with `build.adapter` in `pit.toml` or `--adapter
+./pit-adapters/banana-http`. v0.11 local adapters are deliberately
+declarative: they copy explicitly listed generated assets and reuse trusted
+language tooling; they do not execute downloaded native plugins. Adapter
+identity, version, entrypoint, and asset bytes participate in the build
+fingerprint.
+
+An already-built compatible Component is the final escape hatch:
+
+```bash
+pit build --artifact ./dist/app.wasm --abi wasi-preview2 --world wasi:http/proxy
+```
+
+It is validated and wrapped in the normal artifact manifest without language
+or framework detection. The portable `.wasm` remains authoritative.
+
+### Adapter author guide
+
+1. Choose a stable lower-case `ApplicationInterface` identifier.
+2. Declare a versioned local `adapter.toml` with language, target, and
+   generator assets.
+3. Generate only under `.pit/generated`; never patch user source.
+4. Reuse an existing trusted language builder and emit one self-contained
+   WASI Component.
+5. Include adapter version/digest and generated inputs in cache identity.
+6. Validate unsupported capabilities explicitly and preserve the underlying
+   compiler error in verbose output.
+
+### Detector author guide
+
+A detector returns language, interface/entrypoint suggestions, confidence, and
+evidence. It may recognize a framework dependency as a hint, but it must map
+that hint to an application interface. It must not contain runtime behavior or
+make a detector-known framework a compatibility prerequisite.
+
+The v0.11 adoption fixtures have been exercised through the real PitBox HTTP
+dispatcher with `componentize-py 0.25.0`: Starlette 1.6.0 and Falcon 4.3.1
+both use the same `python/asgi` adapter, and the detector does not need to know
+Falcon. A plain mystery ASGI application also passes with no framework hint.
+FastAPI 0.141.1 was attempted; its `pydantic_core` native CPython extension is
+not available inside the embedded componentize-py runtime, so that application
+is reported as a toolchain incompatibility rather than advertised as supported.
+
 The resulting artifact remains a generic WASI Preview 1 core module or WASI
 Preview 2 Component (`wasi:cli/command` or `wasi:http/proxy`). Embedded JS and
 Python runtimes are part of their Components; PitBox never starts Node, Python,

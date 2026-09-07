@@ -1,0 +1,9 @@
+[project]
+name = "mystery-asgi"
+
+[build]
+language = "python"
+interface = "asgi"
+entry = "main:app"
+adapter = "python/asgi"
+

@@ -1,0 +1,14 @@
+schema = 1
+
+[adapter]
+id = "local/banana-http"
+language = "python"
+interface = "banana-http"
+target = "wasi:http/proxy"
+version = "1.0.0"
+
+[generator]
+kind = "python-template"
+entrypoint = "app"
+files = ["app.py"]
+

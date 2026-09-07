@@ -32,6 +32,13 @@ impl PythonBuilder {
         std::env::var("PITFAST_PYTHON").unwrap_or_else(|_| "python3".into())
     }
     fn wit(request: &BuildRequest) -> Result<PathBuf> {
+        if let Some(path) = request
+            .adapter_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.wit_path.clone())
+        {
+            return Ok(path);
+        }
         let path = request.project_dir.join("wit");
         if path.is_dir() {
             Ok(path)
@@ -160,11 +167,25 @@ impl LanguageBuilder for PythonBuilder {
             .unwrap_or("python-component")
             .replace('-', "_");
         let artifact_path = build.join(format!("{name}.wasm"));
-        let output = Command::new(Self::tool())
+        let mut componentize = Command::new(Self::tool());
+        componentize
             .args(["-d"])
             .arg(&wit)
-            .args(["-w", "wasi:http/proxy@0.2.0", "componentize", "app", "-p"])
-            .arg(&request.project_dir)
+            .args(["-w", "wasi:http/proxy@0.2.0", "componentize"]);
+        if let Some(workspace) = &request.adapter_workspace {
+            for source_root in &workspace.source_roots {
+                componentize.arg("-p").arg(source_root);
+            }
+        } else {
+            componentize.arg("-p").arg(&request.project_dir);
+        }
+        let app_name = request
+            .adapter_workspace
+            .as_ref()
+            .map(|workspace| workspace.entrypoint.as_str())
+            .unwrap_or("app");
+        componentize.arg(app_name);
+        let output = componentize
             .args(["-o"])
             .arg(&artifact_path)
             .current_dir(&request.project_dir)
@@ -198,6 +219,9 @@ impl LanguageBuilder for PythonBuilder {
                 fingerprint: fingerprint.into(),
                 toolchain: Some("componentize-py".into()),
                 toolchain_version: Some(toolchain.version.clone()),
+                application_interface: None,
+                adapter: None,
+                adapter_digest: None,
             },
             runtime: RuntimeSpec {
                 abi: RuntimeAbi::wasi_preview2(),

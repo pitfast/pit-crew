@@ -292,6 +292,9 @@ impl LanguageBuilder for JsBuilder {
                 fingerprint: fingerprint.into(),
                 toolchain: Some("componentize-js".into()),
                 toolchain_version: Some(toolchain.version.clone()),
+                application_interface: None,
+                adapter: None,
+                adapter_digest: None,
             },
             runtime: RuntimeSpec {
                 abi: RuntimeAbi::wasi_preview2(),

@@ -346,6 +346,9 @@ impl LanguageBuilder for NativeBuilder {
                 fingerprint: fingerprint.into(),
                 toolchain: Some("wasi-sdk".into()),
                 toolchain_version: Some(toolchain.version.clone()),
+                application_interface: None,
+                adapter: None,
+                adapter_digest: None,
             },
             runtime: RuntimeSpec {
                 abi: RuntimeAbi::wasi_preview2(),

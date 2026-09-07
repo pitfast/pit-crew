@@ -1,0 +1,9 @@
+[project]
+name = "banana-http"
+
+[build]
+language = "python"
+interface = "banana-http"
+entry = "banana:handle"
+adapter = "./pit-adapters/banana-http"
+

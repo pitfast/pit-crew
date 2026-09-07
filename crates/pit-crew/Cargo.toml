@@ -13,3 +13,5 @@ pit-artifact = { path = "../pit-artifact" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+toml.workspace = true
+sha2.workspace = true

@@ -226,6 +226,9 @@ impl LanguageBuilder for GoBuilder {
                 fingerprint: fingerprint.into(),
                 toolchain: Some("componentize-go".into()),
                 toolchain_version: Some(toolchain.version.clone()),
+                application_interface: None,
+                adapter: None,
+                adapter_digest: None,
             },
             runtime: RuntimeSpec {
                 abi: RuntimeAbi::wasi_preview2(),

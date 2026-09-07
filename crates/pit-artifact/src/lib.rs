@@ -287,6 +287,12 @@ pub struct BuildSpec {
     pub toolchain: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolchain_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_interface: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -589,6 +595,9 @@ mod tests {
                 fingerprint: "b".repeat(64),
                 toolchain: None,
                 toolchain_version: None,
+                application_interface: None,
+                adapter: None,
+                adapter_digest: None,
             },
             runtime: RuntimeSpec {
                 abi: RuntimeAbi::wasi_preview1(),
