@@ -223,9 +223,15 @@ impl LanguageBuilder for GoBuilder {
                 );
             }
         }
+        // Let componentize-go resolve the project's declared world from
+        // componentize-go.toml.  The artifact still advertises the
+        // framework-level wasi:http/proxy contract below, but a project may
+        // import additional explicitly declared capabilities (for example
+        // wasi:sockets for a host-owned resource gateway).  Passing only the
+        // shorthand HTTP world here silently discarded those imports.
         let mut bindings = Command::new(Self::tool());
         bindings
-            .args(["--world", world.as_str(), "bindings", "--format"])
+            .args(["bindings", "--format"])
             .current_dir(&working_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -259,7 +265,7 @@ impl LanguageBuilder for GoBuilder {
         }
         let mut command = Command::new(Self::tool());
         command
-            .args(["--world", world.as_str(), "build", "--output"])
+            .args(["build", "--output"])
             .arg(&staging)
             .current_dir(&working_dir)
             .stdout(Stdio::piped())
